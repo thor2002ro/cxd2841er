@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m := cxd2841er.o
+
+cxd2841er-y := drivers/media/dvb-frontends/cxd2841er.o

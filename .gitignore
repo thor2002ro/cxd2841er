@@ -10,3 +10,4 @@
 modules.order
 Module.symvers
 __pycache__/
+/.docs/

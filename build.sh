@@ -19,12 +19,12 @@ else
     MAKE_FLAGS=""
 fi
 
-make $MAKE_FLAGS -C "$KDIR" M="$(pwd)" modules
+make $MAKE_FLAGS -C "$KDIR" M="$(pwd)/upstream/linux" modules
 
 if [ "$1" = "install" ]; then
     echo "installing to /lib/modules/$(uname -r)/kernel/drivers/media/dvb-frontends/"
     sudo rmmod cxd2841er 2>/dev/null || true
-    sudo install -m 644 cxd2841er.ko \
+    sudo install -m 644 upstream/linux/cxd2841er.ko \
         /lib/modules/$(uname -r)/kernel/drivers/media/dvb-frontends/
     sudo depmod -a
     sudo modprobe cxd2841er

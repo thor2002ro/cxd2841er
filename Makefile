@@ -12,14 +12,14 @@
 
 obj-m := cxd2841er.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
+PWD := $(shell pwd)/upstream/linux
 
 default:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 install: default
 	sudo rmmod cxd2841er 2>/dev/null || true
-	sudo install -m 644 cxd2841er.ko /lib/modules/$(shell uname -r)/kernel/drivers/media/dvb-frontends/
+	sudo install -m 644 upstream/linux/cxd2841er.ko /lib/modules/$(shell uname -r)/kernel/drivers/media/dvb-frontends/
 	sudo depmod -a
 	sudo modprobe cxd2841er
 	@echo "cxd2841er fixed module loaded"
