@@ -26,6 +26,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/bitrev.h>
+#include <linux/ratelimit.h>
 
 #include "tuner-i2c.h"
 #include "r820t.h"
@@ -389,8 +390,9 @@ static int r820t_write(struct r820t_priv *priv, u8 reg, const u8 *val,
 
 		rc = tuner_i2c_xfer_send(&priv->i2c_props, priv->buf, size + 1);
 		if (rc != size + 1) {
-			tuner_info("%s: i2c wr failed=%d reg=%02x len=%d: %*ph\n",
-				   __func__, rc, reg, size, size, &priv->buf[1]);
+			dev_warn_ratelimited(&priv->i2c_props.adap->dev,
+				"r820t addr=0x%02x i2c write failed: reg=0x%02x len=%d result=%d\n",
+				priv->i2c_props.addr, reg, size, rc);
 			if (rc < 0)
 				return rc;
 			return -EREMOTEIO;
@@ -446,8 +448,9 @@ static int r820t_read(struct r820t_priv *priv, u8 reg, u8 *val, int len)
 
 	rc = tuner_i2c_xfer_send_recv(&priv->i2c_props, priv->buf, 1, p, len);
 	if (rc != len) {
-		tuner_info("%s: i2c rd failed=%d reg=%02x len=%d: %*ph\n",
-			   __func__, rc, reg, len, len, p);
+		dev_warn_ratelimited(&priv->i2c_props.adap->dev,
+			"r820t addr=0x%02x i2c read failed: reg=0x%02x len=%d result=%d\n",
+			priv->i2c_props.addr, reg, len, rc);
 		if (rc < 0)
 			return rc;
 		return -EREMOTEIO;
@@ -1112,8 +1115,10 @@ static int r820t_set_tv_standard(struct r820t_priv *priv,
 				return rc;
 
 			rc = r820t_set_pll(priv, type, filt_cal_lo * 1000);
-			if (rc < 0 || !priv->has_lock)
+			if (rc < 0)
 				return rc;
+			if (!priv->has_lock)
+				return -ETIMEDOUT;
 
 			/* Start Trigger */
 			rc = r820t_write_reg_mask(priv, 0x0b, 0x10, 0x10);
@@ -1309,6 +1314,7 @@ static int generic_set_freq(struct dvb_frontend *fe,
 			    v4l2_std_id std, u32 delsys)
 {
 	struct r820t_priv		*priv = fe->tuner_priv;
+	const char *stage = "standard/filter calibration PLL";
 	int				rc;
 	u32				lo_freq;
 
@@ -1324,14 +1330,21 @@ static int generic_set_freq(struct dvb_frontend *fe,
 	 else
 		lo_freq = freq + priv->int_freq;
 
+	stage = "RF mux";
 	rc = r820t_set_mux(priv, lo_freq);
 	if (rc < 0)
 		goto err;
 
+	stage = "tuning PLL";
 	rc = r820t_set_pll(priv, type, lo_freq);
-	if (rc < 0 || !priv->has_lock)
+	if (rc < 0)
 		goto err;
+	if (!priv->has_lock) {
+		rc = -ETIMEDOUT;
+		goto err;
+	}
 
+	stage = "system parameters";
 	rc = r820t_sysfreq_sel(priv, freq, type, std, delsys);
 	if (rc < 0)
 		goto err;
@@ -1342,7 +1355,9 @@ static int generic_set_freq(struct dvb_frontend *fe,
 err:
 
 	if (rc < 0)
-		tuner_dbg("%s: failed=%d\n", __func__, rc);
+		dev_warn_ratelimited(&priv->i2c_props.adap->dev,
+			"r820t addr=0x%02x tuning failed: stage=%s frequency_hz=%u bandwidth_mhz=%u delsys=%u error=%d\n",
+			priv->i2c_props.addr, stage, freq, bw, delsys, rc);
 	return rc;
 }
 
@@ -2166,7 +2181,9 @@ err:
 	mutex_unlock(&priv->lock);
 
 	if (rc < 0)
-		tuner_dbg("%s: failed=%d\n", __func__, rc);
+		dev_warn_ratelimited(&priv->i2c_props.adap->dev,
+			"r820t addr=0x%02x initialization failed: error=%d\n",
+			priv->i2c_props.addr, rc);
 	return rc;
 }
 
@@ -2187,7 +2204,10 @@ static int r820t_sleep(struct dvb_frontend *fe)
 		fe->ops.i2c_gate_ctrl(fe, 0);
 	mutex_unlock(&priv->lock);
 
-	tuner_dbg("%s: failed=%d\n", __func__, rc);
+	if (rc < 0)
+		dev_warn_ratelimited(&priv->i2c_props.adap->dev,
+			"r820t addr=0x%02x standby failed: error=%d\n",
+			priv->i2c_props.addr, rc);
 	return rc;
 }
 
@@ -2401,6 +2421,7 @@ err_no_gate:
 }
 EXPORT_SYMBOL_GPL(r820t_attach);
 
+MODULE_VERSION("1.0.1");
 MODULE_DESCRIPTION("Rafael Micro r820t silicon tuner driver");
 MODULE_AUTHOR("Mauro Carvalho Chehab");
 MODULE_LICENSE("GPL v2");

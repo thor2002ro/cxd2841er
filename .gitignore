@@ -11,3 +11,5 @@ modules.order
 Module.symvers
 __pycache__/
 /.docs/
+/dvb-check
+/dist/

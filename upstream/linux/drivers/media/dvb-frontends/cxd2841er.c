@@ -21,6 +21,7 @@
 #include <linux/log2.h>
 #include <linux/dynamic_debug.h>
 #include <linux/kernel.h>
+#include <linux/ratelimit.h>
 
 #include <linux/int_log.h>
 #include <media/dvb_frontend.h>
@@ -28,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.0.0"
+#define CXD2841ER_VERSION "1.1.1"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -242,7 +243,7 @@ static int cxd2841er_write_regs(struct cxd2841er_priv *priv,
 	if (ret >= 0 && ret != 1)
 		ret = -EIO;
 	if (ret < 0) {
-		dev_warn(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s: i2c wr failed=%d addr=%02x reg=%02x len=%d\n",
 			KBUILD_MODNAME, ret, i2c_addr, reg, len);
 		return ret;
@@ -282,7 +283,7 @@ static int cxd2841er_read_regs(struct cxd2841er_priv *priv,
 	if (ret >= 0 && ret != 2)
 		ret = -EIO;
 	if (ret < 0) {
-		dev_warn(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s: i2c rd failed=%d addr=%02x reg=%02x\n",
 			KBUILD_MODNAME, ret, i2c_addr, reg);
 		return ret;
@@ -323,32 +324,56 @@ static u32 cxd2841er_calc_iffreq(u32 ifhz)
 	return cxd2841er_calc_iffreq_xtal(SONY_XTAL_20500, ifhz);
 }
 
-static int cxd2841er_get_if_hz(struct cxd2841er_priv *priv, u32 def_hz)
+static void cxd2841er_warn_tune(struct cxd2841er_priv *priv,
+			      const char *stage, int error)
 {
-	u32 hz;
+	struct dtv_frontend_properties *p = &priv->frontend.dtv_property_cache;
 
+	if (error)
+		dev_warn_ratelimited(&priv->i2c->dev,
+			"cxd2841er addr=0x%02x %s: delsys=%u frequency=%u %s bandwidth_hz=%u symbol_rate=%u state=%d error=%d\n",
+			priv->i2c_addr_slvt, stage, p->delivery_system, p->frequency,
+			p->delivery_system == SYS_DVBS || p->delivery_system == SYS_DVBS2 ? "kHz" : "Hz",
+			p->bandwidth_hz, p->symbol_rate, priv->state, error);
+}
+
+static int cxd2841er_get_if_hz(struct cxd2841er_priv *priv, u32 def_hz,
+				    u32 *hz)
+{
+	int ret = 0;
+
+	*hz = def_hz;
 	if (priv->frontend.ops.tuner_ops.get_if_frequency
 			&& (priv->flags & CXD2841ER_AUTO_IFHZ))
-		priv->frontend.ops.tuner_ops.get_if_frequency(
-			&priv->frontend, &hz);
-	else
-		hz = def_hz;
-
-	return hz;
+		ret = priv->frontend.ops.tuner_ops.get_if_frequency(
+			&priv->frontend, hz);
+	cxd2841er_warn_tune(priv, "IF frequency", ret);
+	return ret;
 }
 
 static int cxd2841er_tuner_set(struct dvb_frontend *fe)
 {
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
+	bool gate = (priv->flags & CXD2841ER_USE_GATECTRL) &&
+		fe->ops.i2c_gate_ctrl;
+	int ret = 0, close_ret;
 
-	if ((priv->flags & CXD2841ER_USE_GATECTRL) && fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	if (gate) {
+		ret = fe->ops.i2c_gate_ctrl(fe, 1);
+		cxd2841er_warn_tune(priv, "gate open", ret);
+		if (ret)
+			return ret;
+	}
 	if (fe->ops.tuner_ops.set_params)
-		fe->ops.tuner_ops.set_params(fe);
-	if ((priv->flags & CXD2841ER_USE_GATECTRL) && fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
-
-	return 0;
+		ret = fe->ops.tuner_ops.set_params(fe);
+	cxd2841er_warn_tune(priv, "tuner programming", ret);
+	if (gate) {
+		close_ret = fe->ops.i2c_gate_ctrl(fe, 0);
+		cxd2841er_warn_tune(priv, "gate close", close_ret);
+		if (!ret)
+			ret = close_ret;
+	}
+	return ret;
 }
 
 static int cxd2841er_dvbs2_set_symbol_rate(struct cxd2841er_priv *priv,
@@ -884,6 +909,7 @@ static int cxd2841er_shutdown_to_sleep_tc(struct cxd2841er_priv *priv)
 static int cxd2841er_tune_done(struct cxd2841er_priv *priv)
 {
 	const char *stage = "bank select";
+	u8 ts_enable = 0xff;
 	int ret;
 
 	/* Stop here if the bank or reset write fails; later writes would be unsafe. */
@@ -907,10 +933,25 @@ static int cxd2841er_tune_done(struct cxd2841er_priv *priv)
 	/* Enable TS output */
 	stage = "TS enable";
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0xc3, 0x00);
+	if (ret)
+		goto done;
+	/* The USB bridge can acknowledge a write that the demodulator dropped. */
+	stage = "TS verify";
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0xc3, &ts_enable);
+	if (!ret && (ts_enable & 0x01))
+		ret = -EIO;
 done:
+	if (ret)
+		dev_warn_ratelimited(&priv->i2c->dev,
+			"cxd2841er addr=0x%02x %s: frequency=%u %s state=%d system=%u ts_enable=0x%02x error=%d\n",
+			priv->i2c_addr_slvt, stage,
+			priv->frontend.dtv_property_cache.frequency,
+			priv->frontend.dtv_property_cache.delivery_system == SYS_DVBS ||
+			priv->frontend.dtv_property_cache.delivery_system == SYS_DVBS2 ? "kHz" : "Hz",
+			priv->state, priv->system, ts_enable, ret);
 	dev_dbg(&priv->i2c->dev,
-		"%s(): stage=%s state=%d system=%u ret=%d\n",
-		__func__, stage, priv->state, priv->system, ret);
+		"%s(): stage=%s state=%d system=%u ts_enable=0x%02x ret=%d\n",
+		__func__, stage, priv->state, priv->system, ts_enable, ret);
 	return ret;
 }
 
@@ -1583,7 +1624,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -1856,7 +1897,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -1948,7 +1989,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -2012,7 +2053,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -2058,7 +2099,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -2105,7 +2146,7 @@ unfreeze:
 	/* Release the snapshot, but keep the read error if both operations fail. */
 	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (unfreeze_ret)
-		dev_dbg(&priv->i2c->dev,
+		dev_warn_ratelimited(&priv->i2c->dev,
 			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
 			__func__, unfreeze_ret, ret);
 	if (ret)
@@ -2263,53 +2304,33 @@ static void cxd2841er_read_signal_strength(struct dvb_frontend *fe)
 	case SYS_DVBT:
 	case SYS_DVBT2:
 		strength = cxd2841er_read_agc_gain_t_t2(priv,
-							p->delivery_system);
-		if (strength < 0)
-			goto error;
-		p->strength.stat[0].scale = FE_SCALE_DECIBEL;
-		/* Formula was empirically determinated @ 410 MHz */
-		p->strength.stat[0].uvalue = strength * 366 / 100 - 89520;
-		break;	/* Code moved out of the function */
+						p->delivery_system);
+		break;
 	case SYS_DVBC_ANNEX_A:
 	case SYS_DVBC_ANNEX_B:
 	case SYS_DVBC_ANNEX_C:
 		strength = cxd2841er_read_agc_gain_c(priv,
-							p->delivery_system);
-		if (strength < 0)
-			goto error;
-		p->strength.stat[0].scale = FE_SCALE_DECIBEL;
-		/*
-		 * Formula was empirically determinated via linear regression,
-		 * using frequencies: 175 MHz, 410 MHz and 800 MHz, and a
-		 * stream modulated with QAM64
-		 */
-		p->strength.stat[0].uvalue = strength * 4045 / 1000 - 85224;
+						p->delivery_system);
 		break;
 	case SYS_ISDBT:
 		strength = cxd2841er_read_agc_gain_i(priv, p->delivery_system);
-		if (strength < 0)
-			goto error;
-		p->strength.stat[0].scale = FE_SCALE_DECIBEL;
-		/*
-		 * Formula was empirically determinated via linear regression,
-		 * using frequencies: 175 MHz, 410 MHz and 800 MHz.
-		 */
-		p->strength.stat[0].uvalue = strength * 3775 / 1000 - 90185;
 		break;
 	case SYS_DVBS:
 	case SYS_DVBS2:
 		strength = cxd2841er_read_agc_gain_s(priv);
-		if (strength < 0)
-			goto error;
-		p->strength.stat[0].scale = FE_SCALE_RELATIVE;
-		p->strength.stat[0].uvalue = 65535 - strength;
+		if (strength >= 0)
+			strength = 65535 - strength;
 		break;
 	default:
 		goto error;
 	}
+	if (strength < 0)
+		goto error;
+	/* Demodulator AGC is not calibrated RF power for the attached tuner. */
+	p->strength.stat[0].scale = FE_SCALE_RELATIVE;
+	p->strength.stat[0].uvalue = strength;
 	return;
 error:
-	/* A failed AGC read is unavailable, not a calibrated zero-strength signal. */
 	p->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 }
 
@@ -2457,6 +2478,7 @@ static int cxd2841er_dvbt2_set_plp_config(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 						u32 bandwidth)
 {
+	int ret;
 	u32 iffreq, ifhz;
 	u8 data[MAX_WRITE_REGSIZE];
 
@@ -2564,7 +2586,9 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef8bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 4800000);
+		ret = cxd2841er_get_if_hz(priv, 4800000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2594,7 +2618,9 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef7bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 4200000);
+		ret = cxd2841er_get_if_hz(priv, 4200000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2624,7 +2650,9 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef6bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 3600000);
+		ret = cxd2841er_get_if_hz(priv, 3600000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2654,7 +2682,9 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef5bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 3600000);
+		ret = cxd2841er_get_if_hz(priv, 3600000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2684,7 +2714,9 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef17bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 3500000);
+		ret = cxd2841er_get_if_hz(priv, 3500000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2703,6 +2735,7 @@ static int cxd2841er_sleep_tc_to_active_t2_band(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_t_band(
 		struct cxd2841er_priv *priv, u32 bandwidth)
 {
+	int ret;
 	u8 data[MAX_WRITE_REGSIZE];
 	u32 iffreq, ifhz;
 	static const u8 nominalRate8bw[3][5] = {
@@ -2785,7 +2818,9 @@ static int cxd2841er_sleep_tc_to_active_t_band(
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef8bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 4800000);
+		ret = cxd2841er_get_if_hz(priv, 4800000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2822,7 +2857,9 @@ static int cxd2841er_sleep_tc_to_active_t_band(
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef7bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 4200000);
+		ret = cxd2841er_get_if_hz(priv, 4200000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2859,7 +2896,9 @@ static int cxd2841er_sleep_tc_to_active_t_band(
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef6bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 3600000);
+		ret = cxd2841er_get_if_hz(priv, 3600000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2896,7 +2935,9 @@ static int cxd2841er_sleep_tc_to_active_t_band(
 			cxd2841er_write_regs(priv, I2C_SLVT,
 				0xA6, itbCoef5bw[priv->xtal], 14);
 		/* <IF freq setting> */
-		ifhz = cxd2841er_get_if_hz(priv, 3600000);
+		ret = cxd2841er_get_if_hz(priv, 3600000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -2930,6 +2971,7 @@ static int cxd2841er_sleep_tc_to_active_t_band(
 static int cxd2841er_sleep_tc_to_active_i_band(
 		struct cxd2841er_priv *priv, u32 bandwidth)
 {
+	int ret;
 	u32 iffreq, ifhz;
 	u8 data[3];
 
@@ -3000,7 +3042,9 @@ static int cxd2841er_sleep_tc_to_active_i_band(
 				0xA6, itbCoef8bw[priv->xtal], 14);
 
 		/* IF freq setting */
-		ifhz = cxd2841er_get_if_hz(priv, 4750000);
+		ret = cxd2841er_get_if_hz(priv, 4750000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -3031,7 +3075,9 @@ static int cxd2841er_sleep_tc_to_active_i_band(
 				0xA6, itbCoef7bw[priv->xtal], 14);
 
 		/* IF freq setting */
-		ifhz = cxd2841er_get_if_hz(priv, 4150000);
+		ret = cxd2841er_get_if_hz(priv, 4150000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -3062,7 +3108,9 @@ static int cxd2841er_sleep_tc_to_active_i_band(
 				0xA6, itbCoef6bw[priv->xtal], 14);
 
 		/* IF freq setting */
-		ifhz = cxd2841er_get_if_hz(priv, 3550000);
+		ret = cxd2841er_get_if_hz(priv, 3550000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz);
 		data[0] = (u8) ((iffreq >> 16) & 0xff);
 		data[1] = (u8)((iffreq >> 8) & 0xff);
@@ -3099,6 +3147,7 @@ static int cxd2841er_sleep_tc_to_active_i_band(
 static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 					       u32 bandwidth)
 {
+	int ret;
 	u8 bw7_8mhz_b10_a6[] = {
 		0x2D, 0xC7, 0x04, 0xF4, 0x07, 0xC5, 0x2A, 0xB8,
 		0x27, 0x9E, 0x27, 0xA4, 0x29, 0xAB };
@@ -3125,7 +3174,9 @@ static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(
 				priv, I2C_SLVT, 0xa6,
 				bw7_8mhz_b10_a6, sizeof(bw7_8mhz_b10_a6));
-		ifhz = cxd2841er_get_if_hz(priv, 4900000);
+		ret = cxd2841er_get_if_hz(priv, 4900000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq(ifhz);
 		break;
 	case 6000000:
@@ -3133,7 +3184,9 @@ static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 			cxd2841er_write_regs(
 				priv, I2C_SLVT, 0xa6,
 				bw6mhz_b10_a6, sizeof(bw6mhz_b10_a6));
-		ifhz = cxd2841er_get_if_hz(priv, 3700000);
+		ret = cxd2841er_get_if_hz(priv, 3700000, &ifhz);
+		if (ret)
+			return ret;
 		iffreq = cxd2841er_calc_iffreq(ifhz);
 		break;
 	default:
@@ -3184,6 +3237,7 @@ static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_t(struct cxd2841er_priv *priv,
 					  u32 bandwidth)
 {
+	int ret;
 	u8 data[2] = { 0x09, 0x54 };
 	u8 data24m[3] = {0xDC, 0x6C, 0x00};
 
@@ -3245,7 +3299,9 @@ static int cxd2841er_sleep_tc_to_active_t(struct cxd2841er_priv *priv,
 		cxd2841er_write_regs(priv, I2C_SLVT, 0x24, data24m, 3);
 	}
 
-	cxd2841er_sleep_tc_to_active_t_band(priv, bandwidth);
+	ret = cxd2841er_sleep_tc_to_active_t_band(priv, bandwidth);
+	if (ret)
+		return ret;
 	/* Set SLV-T Bank : 0x00 */
 	cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x00);
 	/* Disable HiZ Setting 1 */
@@ -3259,6 +3315,7 @@ static int cxd2841er_sleep_tc_to_active_t(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_t2(struct cxd2841er_priv *priv,
 					   u32 bandwidth)
 {
+	int ret;
 	u8 data[MAX_WRITE_REGSIZE];
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
@@ -3398,7 +3455,9 @@ static int cxd2841er_sleep_tc_to_active_t2(struct cxd2841er_priv *priv,
 		cxd2841er_write_regs(priv, I2C_SLVT, 0x8C, data, 2);
 	}
 
-	cxd2841er_sleep_tc_to_active_t2_band(priv, bandwidth);
+	ret = cxd2841er_sleep_tc_to_active_t2_band(priv, bandwidth);
+	if (ret)
+		return ret;
 
 	/* Set SLV-T Bank : 0x00 */
 	cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x00);
@@ -3414,6 +3473,7 @@ static int cxd2841er_sleep_tc_to_active_t2(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_i(struct cxd2841er_priv *priv,
 		u32 bandwidth)
 {
+	int ret;
 	u8 data[2] = { 0x09, 0x54 };
 	u8 data24m[2] = {0x60, 0x00};
 	u8 data24m2[3] = {0xB7, 0x1B, 0x00};
@@ -3478,7 +3538,9 @@ static int cxd2841er_sleep_tc_to_active_i(struct cxd2841er_priv *priv,
 	cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x60);
 	cxd2841er_write_regs(priv, I2C_SLVT, 0xA8, data24m2, 3);
 
-	cxd2841er_sleep_tc_to_active_i_band(priv, bandwidth);
+	ret = cxd2841er_sleep_tc_to_active_i_band(priv, bandwidth);
+	if (ret)
+		return ret;
 	/* Set SLV-T Bank : 0x00 */
 	cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x00);
 	/* Disable HiZ Setting 1 */
@@ -3492,6 +3554,7 @@ static int cxd2841er_sleep_tc_to_active_i(struct cxd2841er_priv *priv,
 static int cxd2841er_sleep_tc_to_active_c(struct cxd2841er_priv *priv,
 					  u32 bandwidth)
 {
+	int ret;
 	u8 data[2] = { 0x09, 0x54 };
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
@@ -3538,7 +3601,9 @@ static int cxd2841er_sleep_tc_to_active_c(struct cxd2841er_priv *priv,
 	cxd2841er_set_reg_bits(priv, I2C_SLVT, 0xce, 0x01, 0x01);
 	cxd2841er_set_reg_bits(priv, I2C_SLVT, 0xcf, 0x01, 0x01);
 
-	cxd2841er_sleep_tc_to_active_c_band(priv, bandwidth);
+	ret = cxd2841er_sleep_tc_to_active_c_band(priv, bandwidth);
+	if (ret)
+		return ret;
 	/* Set SLV-T Bank : 0x00 */
 	cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x00);
 	/* Disable HiZ Setting 1 */
@@ -3606,8 +3671,11 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 		(p->delivery_system == SYS_DVBS ? "DVB-S" : "DVB-S2"),
 		 p->frequency, symbol_rate, priv->xtal);
 
-	if (priv->flags & CXD2841ER_EARLY_TUNE)
-		cxd2841er_tuner_set(fe);
+	if (priv->flags & CXD2841ER_EARLY_TUNE) {
+		ret = cxd2841er_tuner_set(fe);
+		if (ret)
+			goto done;
+	}
 
 	switch (priv->state) {
 	case STATE_SLEEP_S:
@@ -3628,8 +3696,11 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 		goto done;
 	}
 
-	if (!(priv->flags & CXD2841ER_EARLY_TUNE))
-		cxd2841er_tuner_set(fe);
+	if (!(priv->flags & CXD2841ER_EARLY_TUNE)) {
+		ret = cxd2841er_tuner_set(fe);
+		if (ret)
+			goto done;
+	}
 
 	ret = cxd2841er_tune_done(priv);
 	if (ret)
@@ -3648,6 +3719,9 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 		i++;
 	} while (i < timeout / CXD2841ER_DVBS_POLLING_INVL);
 
+	if (!(status & FE_HAS_LOCK))
+		cxd2841er_warn_tune(priv, "demod lock wait expired", -ETIMEDOUT);
+
 	if (status & FE_HAS_LOCK) {
 		ret = cxd2841er_get_carrier_offset_s_s2(priv, &carr_offset);
 		if (ret)
@@ -3656,6 +3730,7 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 			__func__, carr_offset);
 	}
 done:
+	cxd2841er_warn_tune(priv, __func__, ret);
 	dev_dbg(&priv->i2c->dev,
 		"%s(): delsys=%u frequency=%u symbol_rate=%u status=0x%x ret=%d\n",
 		__func__, p->delivery_system, p->frequency, p->symbol_rate,
@@ -3683,8 +3758,11 @@ static int cxd2841er_set_frontend_tc(struct dvb_frontend *fe)
 	dev_dbg(&priv->i2c->dev, "%s() delivery_system=%d bandwidth_hz=%d\n",
 		 __func__, p->delivery_system, p->bandwidth_hz);
 
-	if (priv->flags & CXD2841ER_EARLY_TUNE)
-		cxd2841er_tuner_set(fe);
+	if (priv->flags & CXD2841ER_EARLY_TUNE) {
+		ret = cxd2841er_tuner_set(fe);
+		if (ret)
+			goto done;
+	}
 
 	/* deconfigure/put demod to sleep on delsys switch if active */
 	if (priv->state == STATE_ACTIVE_TC &&
@@ -3776,8 +3854,11 @@ static int cxd2841er_set_frontend_tc(struct dvb_frontend *fe)
 	if (ret)
 		goto done;
 
-	if (!(priv->flags & CXD2841ER_EARLY_TUNE))
-		cxd2841er_tuner_set(fe);
+	if (!(priv->flags & CXD2841ER_EARLY_TUNE)) {
+		ret = cxd2841er_tuner_set(fe);
+		if (ret)
+			goto done;
+	}
 
 	ret = cxd2841er_tune_done(priv);
 	if (ret)
@@ -3796,10 +3877,10 @@ static int cxd2841er_set_frontend_tc(struct dvb_frontend *fe)
 		msleep(20);
 		timeout -= 20;
 	}
-	if (timeout < 0)
-		dev_dbg(&priv->i2c->dev,
-			"%s(): LOCK wait timeout\n", __func__);
+	if (!(status & FE_HAS_LOCK))
+		cxd2841er_warn_tune(priv, "demod lock wait expired", -ETIMEDOUT);
 done:
+	cxd2841er_warn_tune(priv, __func__, ret);
 	dev_dbg(&priv->i2c->dev,
 		"%s(): delsys=%u frequency=%u bandwidth=%u wait_lock=%u status=0x%x ret=%d\n",
 		__func__, p->delivery_system, p->frequency, p->bandwidth_hz,

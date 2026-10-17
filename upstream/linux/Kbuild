@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
-obj-m := cxd2841er.o
+obj-m := cxd2841er.o r820t.o
 
 cxd2841er-y := drivers/media/dvb-frontends/cxd2841er.o
+r820t-y := drivers/media/tuners/r820t.o
