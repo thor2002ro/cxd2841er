@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.6"
+#define CXD2841ER_VERSION "1.1.7"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -62,6 +62,7 @@ struct cxd2841er_priv {
 	enum cxd2841er_state		state;
 	u8				system;
 	enum cxd2841er_xtal		xtal;
+	bool				cable_24mhz;
 	enum fe_caps caps;
 	u32				flags;
 	unsigned long			stats_time;
@@ -3772,7 +3773,6 @@ static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 		ret = cxd2841er_get_if_hz(priv, 4900000, &ifhz);
 		if (ret)
 			return ret;
-		iffreq = cxd2841er_calc_iffreq(ifhz);
 		break;
 	case 6000000:
 		if (priv->flags & CXD2841ER_ASCOT) {
@@ -3785,13 +3785,15 @@ static int cxd2841er_sleep_tc_to_active_c_band(struct cxd2841er_priv *priv,
 		ret = cxd2841er_get_if_hz(priv, 3700000, &ifhz);
 		if (ret)
 			return ret;
-		iffreq = cxd2841er_calc_iffreq(ifhz);
 		break;
 	default:
 		dev_err(&priv->i2c->dev, "%s(): unsupported bandwidth %d\n",
 			__func__, bandwidth);
 		return -EINVAL;
 	}
+	iffreq = priv->cable_24mhz ?
+		cxd2841er_calc_iffreq_xtal(priv->xtal, ifhz) :
+		cxd2841er_calc_iffreq(ifhz);
 	/* <IF freq setting> */
 	b10_b6[0] = (u8) ((iffreq >> 16) & 0xff);
 	b10_b6[1] = (u8)((iffreq >> 8) & 0xff);
@@ -4529,6 +4531,42 @@ static int cxd2841er_sleep_tc_to_active_c(struct cxd2841er_priv *priv,
 	ret = cxd2841er_set_reg_bits(priv, I2C_SLVT, 0xcf, 0x01, 0x01);
 	if (ret)
 		return ret;
+
+	if (priv->cable_24mhz) {
+		const u8 b40_54[] = { 0x29, 0x09 };
+		const u8 b40_8b[] = { 0x08, 0x38, 0x83, 0x0e };
+		const u8 b48_24[] = { 0xdc, 0x6c };
+		const u8 b49_11[] = { 0x77, 0x00 };
+
+		ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x40);
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_regs(priv, I2C_SLVT, 0x54,
+					 b40_54, sizeof(b40_54));
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_regs(priv, I2C_SLVT, 0x8b,
+					 b40_8b, sizeof(b40_8b));
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_reg(priv, I2C_SLVT, 0xbf, 0x60);
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x48);
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_regs(priv, I2C_SLVT, 0x24,
+					 b48_24, sizeof(b48_24));
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x49);
+		if (ret)
+			return ret;
+		ret = cxd2841er_write_regs(priv, I2C_SLVT, 0x11,
+					 b49_11, sizeof(b49_11));
+		if (ret)
+			return ret;
+	}
 
 	ret = cxd2841er_sleep_tc_to_active_c_band(priv, bandwidth);
 	if (ret)
@@ -5434,6 +5472,10 @@ static struct dvb_frontend *cxd2841er_attach(struct cxd2841er_config *cfg,
 		kfree(priv);
 		return NULL;
 	}
+	/* The recovered 24 MHz cable recipe covers these IDs, not A7. */
+	priv->cable_24mhz = priv->xtal == SONY_XTAL_24000 &&
+		(chip_id == CXD2837ER_CHIP_ID || chip_id == CXD2843ER_CHIP_ID ||
+		 chip_id == CXD2854ER_CHIP_ID);
 
 	/* create dvb_frontend */
 	if (system == SYS_DVBS) {
