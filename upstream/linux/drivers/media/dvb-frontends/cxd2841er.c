@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.5"
+#define CXD2841ER_VERSION "1.1.6"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -1374,10 +1374,13 @@ static u8 cxd2841er_chip_id(struct cxd2841er_priv *priv)
 	u8 chip_id = 0;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
-	if (cxd2841er_write_reg(priv, I2C_SLVT, 0, 0) == 0)
-		cxd2841er_read_reg(priv, I2C_SLVT, 0xfd, &chip_id);
-	else if (cxd2841er_write_reg(priv, I2C_SLVX, 0, 0) == 0)
-		cxd2841er_read_reg(priv, I2C_SLVX, 0xfd, &chip_id);
+	if (cxd2841er_write_reg(priv, I2C_SLVT, 0, 0) == 0) {
+		if (cxd2841er_read_reg(priv, I2C_SLVT, 0xfd, &chip_id))
+			return 0;
+	} else if (cxd2841er_write_reg(priv, I2C_SLVX, 0, 0) == 0) {
+		if (cxd2841er_read_reg(priv, I2C_SLVX, 0xfd, &chip_id))
+			return 0;
+	}
 
 	return chip_id;
 }
@@ -1532,7 +1535,7 @@ static int cxd2841er_read_status_tc(struct dvb_frontend *fe,
 					FE_HAS_CARRIER |
 					FE_HAS_VITERBI |
 					FE_HAS_SYNC;
-			if (tslock)
+			if (sync && tslock)
 				*status |= FE_HAS_LOCK;
 		} else if (priv->system == SYS_ISDBT) {
 			ret = cxd2841er_read_status_i(
@@ -1701,8 +1704,8 @@ static int cxd2841er_get_carrier_offset_i(struct cxd2841er_priv *priv,
 static int cxd2841er_get_carrier_offset_t(struct cxd2841er_priv *priv,
 					   u32 bandwidth, int *offset)
 {
-	int ret;
-	u8 data[4];
+	int ret, unfreeze_ret;
+	u8 data[4], sync, tslock, unlock;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
 	if (priv->state != STATE_ACTIVE_TC) {
@@ -1715,12 +1718,24 @@ static int cxd2841er_get_carrier_offset_t(struct cxd2841er_priv *priv,
 			__func__, priv->system);
 		return -EINVAL;
 	}
-	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x10);
+	ret = cxd2841er_freeze_regs(priv);
 	if (ret)
 		return ret;
+	ret = cxd2841er_read_status_t_t2(priv, &sync, &tslock, &unlock);
+	if (ret)
+		goto unfreeze;
+	if (!sync) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x4c, data, sizeof(data));
+
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (ret)
 		return ret;
+	if (unfreeze_ret)
+		return unfreeze_ret;
 	*offset = div_s64(-(s64)sign_extend32(
 		((u32)(data[0] & 0x1F) << 24) | ((u32)data[1] << 16) |
 		((u32)data[2] << 8) | (u32)data[3], 28) *
@@ -1731,8 +1746,8 @@ static int cxd2841er_get_carrier_offset_t(struct cxd2841er_priv *priv,
 static int cxd2841er_get_carrier_offset_t2(struct cxd2841er_priv *priv,
 					   u32 bandwidth, int *offset)
 {
-	int ret;
-	u8 data[4];
+	int ret, unfreeze_ret;
+	u8 data[4], sync, tslock, unlock;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
 	if (priv->state != STATE_ACTIVE_TC) {
@@ -1745,12 +1760,24 @@ static int cxd2841er_get_carrier_offset_t2(struct cxd2841er_priv *priv,
 			__func__, priv->system);
 		return -EINVAL;
 	}
-	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x20);
+	ret = cxd2841er_freeze_regs(priv);
 	if (ret)
 		return ret;
+	ret = cxd2841er_read_status_t_t2(priv, &sync, &tslock, &unlock);
+	if (ret)
+		goto unfreeze;
+	if (!sync) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x4c, data, sizeof(data));
+
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (ret)
 		return ret;
+	if (unfreeze_ret)
+		return unfreeze_ret;
 	*offset = -1 * sign_extend32(
 		((u32)(data[0] & 0x0F) << 24) | ((u32)data[1] << 16) |
 		((u32)data[2] << 8) | (u32)data[3], 27);
@@ -1776,8 +1803,8 @@ static int cxd2841er_get_carrier_offset_t2(struct cxd2841er_priv *priv,
 static int cxd2841er_get_carrier_offset_c(struct cxd2841er_priv *priv,
 					  int *offset)
 {
-	int ret;
-	u8 data[2];
+	int ret, unfreeze_ret;
+	u8 data[2], arlock;
 
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
 	if (priv->state != STATE_ACTIVE_TC) {
@@ -1790,12 +1817,28 @@ static int cxd2841er_get_carrier_offset_c(struct cxd2841er_priv *priv,
 			__func__, priv->system);
 		return -EINVAL;
 	}
+	ret = cxd2841er_freeze_regs(priv);
+	if (ret)
+		return ret;
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x40);
 	if (ret)
-		return ret;
+		goto unfreeze;
+	/* Validate lock in the same snapshot as the carrier estimate. */
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x88, &arlock);
+	if (ret)
+		goto unfreeze;
+	if (!(arlock & 0x01)) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x15, data, sizeof(data));
+
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (ret)
 		return ret;
+	if (unfreeze_ret)
+		return unfreeze_ret;
 	*offset = div_s64(41000000LL * sign_extend32((((u32)data[0] & 0x3f) << 8)
 						| (u32)data[1], 13), 16384);
 	return 0;
