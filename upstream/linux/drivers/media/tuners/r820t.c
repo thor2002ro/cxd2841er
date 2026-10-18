@@ -1354,10 +1354,12 @@ static int generic_set_freq(struct dvb_frontend *fe,
 
 err:
 
-	if (rc < 0)
+	if (rc < 0) {
+		priv->has_lock = false;
 		dev_warn_ratelimited(&priv->i2c_props.adap->dev,
 			"r820t addr=0x%02x tuning failed: stage=%s frequency_hz=%u bandwidth_mhz=%u delsys=%u error=%d\n",
 			priv->i2c_props.addr, stage, freq, bw, delsys, rc);
+	}
 	return rc;
 }
 
@@ -2159,13 +2161,17 @@ static int r820t_gpio(struct r820t_priv *priv, bool enable)
 static int r820t_init(struct dvb_frontend *fe)
 {
 	struct r820t_priv *priv = fe->tuner_priv;
-	int rc;
+	int rc, gate_rc;
 
 	tuner_dbg("%s:\n", __func__);
 
 	mutex_lock(&priv->lock);
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	priv->has_lock = false;
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto unlock;
+	}
 
 	rc = r820t_imr_callibrate(priv);
 	if (rc < 0)
@@ -2176,8 +2182,14 @@ static int r820t_init(struct dvb_frontend *fe)
 			 r820t_init_array, sizeof(r820t_init_array));
 
 err:
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+unlock:
+	if (rc < 0)
+		priv->init_done = false;
 	mutex_unlock(&priv->lock);
 
 	if (rc < 0)
@@ -2190,18 +2202,26 @@ err:
 static int r820t_sleep(struct dvb_frontend *fe)
 {
 	struct r820t_priv *priv = fe->tuner_priv;
-	int rc;
+	int rc, gate_rc;
 
 	tuner_dbg("%s:\n", __func__);
 
 	mutex_lock(&priv->lock);
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto unlock;
+	}
 
+	priv->has_lock = false;
 	rc = r820t_standby(priv);
 
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+unlock:
 	mutex_unlock(&priv->lock);
 
 	if (rc < 0)
@@ -2216,7 +2236,7 @@ static int r820t_set_analog_freq(struct dvb_frontend *fe,
 {
 	struct r820t_priv *priv = fe->tuner_priv;
 	unsigned bw;
-	int rc;
+	int rc, gate_rc;
 
 	tuner_dbg("%s called\n", __func__);
 
@@ -2230,14 +2250,23 @@ static int r820t_set_analog_freq(struct dvb_frontend *fe,
 		bw = 8;
 
 	mutex_lock(&priv->lock);
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto unlock;
+	}
 
 	rc = generic_set_freq(fe, 62500l * p->frequency, bw,
 			      V4L2_TUNER_ANALOG_TV, p->std, SYS_UNDEFINED);
 
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+unlock:
+	if (rc < 0)
+		priv->has_lock = false;
 	mutex_unlock(&priv->lock);
 
 	return rc;
@@ -2247,15 +2276,18 @@ static int r820t_set_params(struct dvb_frontend *fe)
 {
 	struct r820t_priv *priv = fe->tuner_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
-	int rc;
+	int rc, gate_rc;
 	unsigned bw;
 
 	tuner_dbg("%s: delivery_system=%d frequency=%d bandwidth_hz=%d\n",
 		__func__, c->delivery_system, c->frequency, c->bandwidth_hz);
 
 	mutex_lock(&priv->lock);
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto unlock;
+	}
 
 	bw = (c->bandwidth_hz + 500000) / 1000000;
 	if (!bw)
@@ -2264,8 +2296,14 @@ static int r820t_set_params(struct dvb_frontend *fe)
 	rc = generic_set_freq(fe, c->frequency, bw,
 			      V4L2_TUNER_DIGITAL_TV, 0, c->delivery_system);
 
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+unlock:
+	if (rc < 0)
+		priv->has_lock = false;
 	mutex_unlock(&priv->lock);
 
 	if (rc)
@@ -2276,36 +2314,46 @@ static int r820t_set_params(struct dvb_frontend *fe)
 static int r820t_signal(struct dvb_frontend *fe, u16 *strength)
 {
 	struct r820t_priv *priv = fe->tuner_priv;
-	int rc = 0;
+	int rc = 0, gate_rc, gain = 0;
 
+	*strength = 0;
 	mutex_lock(&priv->lock);
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto unlock;
+	}
 
 	if (priv->has_lock) {
-		rc = r820t_read_gain(priv);
-		if (rc < 0)
+		gain = r820t_read_gain(priv);
+		if (gain < 0) {
+			rc = gain;
 			goto err;
+		}
 
 		/* A higher gain at LNA means a lower signal strength */
-		*strength = (45 - rc) << 4 | 0xff;
+		*strength = (45 - gain) << 4 | 0xff;
 		if (*strength == 0xff)
 			*strength = 0;
-	} else {
-		*strength = 0;
 	}
 
 err:
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+unlock:
+	if (rc < 0)
+		*strength = 0;
 	mutex_unlock(&priv->lock);
 
 	tuner_dbg("%s: %s, gain=%d strength=%d\n",
 		  __func__,
 		  priv->has_lock ? "PLL locked" : "no signal",
-		  rc, *strength);
+		  gain, *strength);
 
-	return 0;
+	return rc;
 }
 
 static int r820t_get_if_frequency(struct dvb_frontend *fe, u32 *frequency)
@@ -2356,6 +2404,7 @@ struct dvb_frontend *r820t_attach(struct dvb_frontend *fe,
 {
 	struct r820t_priv *priv;
 	int rc = -ENODEV;
+	int gate_rc;
 	u8 data[5];
 	int instance;
 
@@ -2377,30 +2426,44 @@ struct dvb_frontend *r820t_attach(struct dvb_frontend *fe,
 
 		fe->tuner_priv = priv;
 		break;
-	case 2:
+	default:
 		/* existing tuner instance */
 		fe->tuner_priv = priv;
 		break;
 	}
 
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 1);
+	mutex_lock(&priv->lock);
+	if (fe->ops.i2c_gate_ctrl) {
+		rc = fe->ops.i2c_gate_ctrl(fe, 1);
+		if (rc < 0)
+			goto err_unlock;
+	}
 
 	/* check if the tuner is there */
 	rc = r820t_read(priv, 0x00, data, sizeof(data));
 	if (rc < 0)
 		goto err;
 
-	rc = r820t_sleep(fe);
-	if (rc < 0)
-		goto err;
+	priv->has_lock = false;
+	rc = r820t_standby(priv);
+
+err:
+	if (fe->ops.i2c_gate_ctrl) {
+		gate_rc = fe->ops.i2c_gate_ctrl(fe, 0);
+		if (!rc)
+			rc = gate_rc;
+	}
+err_unlock:
+	mutex_unlock(&priv->lock);
+	if (rc < 0) {
+		hybrid_tuner_release_state(priv);
+		fe->tuner_priv = NULL;
+		goto err_no_gate;
+	}
 
 	tuner_info(
 		"Rafael Micro r820t successfully identified, chip type: %s\n",
 		r820t_chip_enum_to_str(cfg->rafael_chip));
-
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
 
 	mutex_unlock(&r820t_list_mutex);
 
@@ -2408,20 +2471,15 @@ struct dvb_frontend *r820t_attach(struct dvb_frontend *fe,
 			sizeof(struct dvb_tuner_ops));
 
 	return fe;
-err:
-	if (fe->ops.i2c_gate_ctrl)
-		fe->ops.i2c_gate_ctrl(fe, 0);
-
 err_no_gate:
 	mutex_unlock(&r820t_list_mutex);
 
 	pr_info("%s: failed=%d\n", __func__, rc);
-	r820t_release(fe);
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(r820t_attach);
 
-MODULE_VERSION("1.0.1");
+MODULE_VERSION("1.0.2");
 MODULE_DESCRIPTION("Rafael Micro r820t silicon tuner driver");
 MODULE_AUTHOR("Mauro Carvalho Chehab");
 MODULE_LICENSE("GPL v2");
