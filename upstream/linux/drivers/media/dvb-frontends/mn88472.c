@@ -232,6 +232,10 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		QAM_64, QAM_256, QAM_128, QAM_32, QAM_16,
 		QAM_AUTO, QAM_AUTO, QAM_AUTO,
 	};
+	static const enum fe_modulation t2_modulation[] = {
+		QPSK, QAM_16, QAM_64, QAM_256,
+		QAM_AUTO, QAM_AUTO, QAM_AUTO, QAM_AUTO,
+	};
 	static const enum fe_hierarchy hierarchy[] = {
 		HIERARCHY_NONE, HIERARCHY_1, HIERARCHY_2, HIERARCHY_4,
 		HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO,
@@ -239,6 +243,10 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	static const enum fe_code_rate code_rate[] = {
 		FEC_1_2, FEC_2_3, FEC_3_4, FEC_5_6, FEC_7_8,
 		FEC_AUTO, FEC_AUTO, FEC_AUTO,
+	};
+	static const enum fe_code_rate t2_code_rate[] = {
+		FEC_1_2, FEC_3_5, FEC_2_3, FEC_3_4,
+		FEC_4_5, FEC_5_6, FEC_AUTO, FEC_AUTO,
 	};
 	static const enum fe_transmit_mode transmission_mode[] = {
 		TRANSMISSION_MODE_2K, TRANSMISSION_MODE_8K,
@@ -253,6 +261,12 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	static const enum fe_guard_interval guard_interval[] = {
 		GUARD_INTERVAL_1_32, GUARD_INTERVAL_1_16,
 		GUARD_INTERVAL_1_8, GUARD_INTERVAL_1_4,
+	};
+	static const enum fe_guard_interval t2_guard_interval[] = {
+		GUARD_INTERVAL_1_32, GUARD_INTERVAL_1_16,
+		GUARD_INTERVAL_1_8, GUARD_INTERVAL_1_4,
+		GUARD_INTERVAL_1_128, GUARD_INTERVAL_19_128,
+		GUARD_INTERVAL_19_256, GUARD_INTERVAL_AUTO,
 	};
 	unsigned int utmp;
 	u8 buf[3];
@@ -270,8 +284,30 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		ret = regmap_read(dev->regmap[2], 0x93, &utmp);
 		if (ret)
 			goto err;
+		buf[0] = utmp;
 
-		c->transmission_mode = t2_transmission_mode[utmp & 0x07];
+		/* Preserve C4's upper control bits when selecting the L1 monitor. */
+		ret = regmap_update_bits(dev->regmap[2], 0xc4, 0x1f, 0x00);
+		if (ret)
+			goto err;
+		ret = regmap_write(dev->regmap[2], 0xc5, 0x00);
+		if (ret)
+			goto err;
+		ret = regmap_read(dev->regmap[2], 0xc8, &utmp);
+		if (ret)
+			goto err;
+		buf[1] = utmp;
+		ret = regmap_write(dev->regmap[2], 0xc5, 0x03);
+		if (ret)
+			goto err;
+		ret = regmap_read(dev->regmap[2], 0xc7, &utmp);
+		if (ret)
+			goto err;
+
+		c->transmission_mode = t2_transmission_mode[buf[0] & 0x07];
+		c->guard_interval = t2_guard_interval[(buf[1] >> 4) & 0x07];
+		c->modulation = t2_modulation[(utmp >> 5) & 0x07];
+		c->fec_inner = t2_code_rate[(utmp >> 2) & 0x07];
 		return 0;
 	}
 	if (c->delivery_system == SYS_DVBC_ANNEX_A) {
