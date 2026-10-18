@@ -33,7 +33,8 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		ret = regmap_read(dev->regmap[0], 0x7f, &utmp);
 		if (ret)
 			goto err;
-		if ((utmp & 0x0f) >= 0x09)
+		/* OFDM or mode-search errors invalidate the acquisition stage. */
+		if (!(utmp & 0xa0) && (utmp & 0x0f) >= 0x09)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
 		else
@@ -43,7 +44,10 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		ret = regmap_read(dev->regmap[2], 0x92, &utmp);
 		if (ret)
 			goto err;
-		if ((utmp & 0x0f) >= 0x0d)
+		/* P1 acquisition give-up invalidates the stage nibble. */
+		if (utmp & 0x40)
+			*status = 0;
+		else if ((utmp & 0x0f) >= 0x0d)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
 		else if ((utmp & 0x0f) >= 0x0a)
@@ -435,9 +439,10 @@ static int mn88472_init(struct dvb_frontend *fe)
 
 	for (rem = firmware->size; rem > 0; rem -= (dev->i2c_write_max - 1)) {
 		len = min(dev->i2c_write_max - 1, rem);
-		ret = regmap_bulk_write(dev->regmap[0], 0xf6,
-					&firmware->data[firmware->size - rem],
-					len);
+		/* F6 is a fixed program-data port, including split transfers. */
+		ret = regmap_noinc_write(dev->regmap[0], 0xf6,
+					 &firmware->data[firmware->size - rem],
+					 len);
 		if (ret) {
 			dev_err(&client->dev, "firmware download failed %d\n",
 				ret);
