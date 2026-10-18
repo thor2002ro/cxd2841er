@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.9"
+#define CXD2841ER_VERSION "1.1.10"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -4625,6 +4625,13 @@ static int cxd2841er_get_frontend(struct dvb_frontend *fe,
 	else if (priv->state == STATE_ACTIVE_TC)
 		ret = cxd2841er_read_status_tc(fe, &status);
 	if (ret) {
+		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		goto unavailable;
+	}
+	/* Properties can change before DTV_TUNE switches the active decoder. */
+	if (priv->system != c->delivery_system &&
+	    !(priv->system == SYS_DVBC_ANNEX_A &&
+	      c->delivery_system == SYS_DVBC_ANNEX_C)) {
 		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 		goto unavailable;
 	}
