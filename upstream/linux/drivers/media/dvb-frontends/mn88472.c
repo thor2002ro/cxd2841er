@@ -564,6 +564,11 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		ret = regmap_write(dev->regmap[1], 0xf6, 0x05);
 		if (ret)
 			goto err;
+		/* Explicit IDs and the ordinal-zero fallback use different modes. */
+		ret = regmap_update_bits(dev->regmap[2], 0x30, 0x80,
+					 c->stream_id > 0xff ? 0x80 : 0x00);
+		if (ret)
+			goto err;
 		ret = regmap_write(dev->regmap[2], 0x32,
 				(c->stream_id > 0xff) ? 0 :
 				c->stream_id );
