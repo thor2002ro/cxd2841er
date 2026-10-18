@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.4"
+#define CXD2841ER_VERSION "1.1.5"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -233,9 +233,9 @@ static int cxd2841er_write_regs(struct cxd2841er_priv *priv,
 		}
 	};
 
-	if (len + 1 >= sizeof(buf)) {
-		dev_warn(&priv->i2c->dev, "wr reg=%04x: len=%d is too big!\n",
-			 reg, len + 1);
+	if (len > MAX_WRITE_REGSIZE) {
+		dev_warn(&priv->i2c->dev, "wr reg=%04x: len=%u is too big!\n",
+			 reg, len);
 		return -E2BIG;
 	}
 
@@ -454,7 +454,7 @@ static int cxd2841er_sleep_s_to_active_s(struct cxd2841er_priv *priv,
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x00);
 	if (ret)
 		return ret;
-	/* Enable S/S2 auto detection 1 */
+	/* Disable S/S2 auto detection 1 for the requested fixed system. */
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x2d, data[0]);
 	if (ret)
 		return ret;
@@ -462,7 +462,7 @@ static int cxd2841er_sleep_s_to_active_s(struct cxd2841er_priv *priv,
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0xae);
 	if (ret)
 		return ret;
-	/* Enable S/S2 auto detection 2 */
+	/* Disable S/S2 auto detection 2 for the requested fixed system. */
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x30, data[0]);
 	if (ret)
 		return ret;
@@ -540,6 +540,7 @@ static int cxd2841er_sleep_s_to_active_s(struct cxd2841er_priv *priv,
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x81, 0x00);
 	if (ret)
 		return ret;
+	priv->system = system;
 	priv->state = STATE_ACTIVE_S;
 	return 0;
 }
@@ -1568,17 +1569,20 @@ done:
 static int cxd2841er_get_carrier_offset_s_s2(struct cxd2841er_priv *priv,
 					     int *offset)
 {
-	int ret;
+	int ret, unfreeze_ret;
 	u8 data[3];
 	u8 is_hs_mode;
 	s32 cfrl_ctrlval;
-	s32 temp_div, temp_q, temp_r;
+	s32 temp_num, temp_div, temp_q, temp_r;
 
 	if (priv->state != STATE_ACTIVE_S) {
 		dev_dbg(&priv->i2c->dev, "%s(): invalid state %d\n",
 			__func__, priv->state);
 		return -EINVAL;
 	}
+	ret = cxd2841er_freeze_regs(priv);
+	if (ret)
+		return ret;
 	/*
 	 * Get High Sampling Rate mode
 	 *  slave     Bank      Addr      Bit      Signal name
@@ -1586,10 +1590,10 @@ static int cxd2841er_get_carrier_offset_s_s2(struct cxd2841er_priv *priv,
 	 */
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0xa0);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x10, &data[0]);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	if (data[0] & 0x01) {
 		/*
 		 *  slave     Bank      Addr      Bit      Signal name
@@ -1597,13 +1601,14 @@ static int cxd2841er_get_carrier_offset_s_s2(struct cxd2841er_priv *priv,
 		 */
 		ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x50, &data[0]);
 		if (ret)
-			return ret;
+			goto unfreeze;
 		is_hs_mode = (data[0] & 0x10 ? 1 : 0);
 	} else {
 		dev_dbg(&priv->i2c->dev,
 			"%s(): unable to detect sampling rate mode\n",
 			__func__);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unfreeze;
 	}
 	/*
 	 *  slave     Bank      Addr      Bit      Signal name
@@ -1612,17 +1617,28 @@ static int cxd2841er_get_carrier_offset_s_s2(struct cxd2841er_priv *priv,
 	 * <SLV-T>    A0h       47h       [7:0]    ICFRL_CTRLVAL[7:0]
 	 */
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x45, data, 3);
+
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
 	if (ret)
 		return ret;
+	if (unfreeze_ret)
+		return unfreeze_ret;
 	cfrl_ctrlval = sign_extend32((((u32)data[0] & 0x1F) << 16) |
 				(((u32)data[1] & 0xFF) <<  8) |
 				((u32)data[2] & 0xFF), 20);
-	temp_div = (is_hs_mode ? 1048576 : 1572864);
+	if (priv->xtal == SONY_XTAL_24000) {
+		temp_num = is_hs_mode ? 375 : 125;
+		temp_div = is_hs_mode ? 4096 : 2048;
+	} else {
+		temp_num = 97375;
+		temp_div = is_hs_mode ? 1048576 : 1572864;
+	}
 	if (cfrl_ctrlval > 0) {
-		temp_q = div_s64_rem(97375LL * cfrl_ctrlval,
+		temp_q = div_s64_rem((s64)temp_num * cfrl_ctrlval,
 			temp_div, &temp_r);
 	} else {
-		temp_q = div_s64_rem(-97375LL * cfrl_ctrlval,
+		temp_q = div_s64_rem(-(s64)temp_num * cfrl_ctrlval,
 			temp_div, &temp_r);
 	}
 	if (temp_r >= temp_div / 2)
@@ -1780,7 +1796,7 @@ static int cxd2841er_get_carrier_offset_c(struct cxd2841er_priv *priv,
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x15, data, sizeof(data));
 	if (ret)
 		return ret;
-	*offset = div_s64(41000LL * sign_extend32((((u32)data[0] & 0x3f) << 8)
+	*offset = div_s64(41000000LL * sign_extend32((((u32)data[0] & 0x3f) << 8)
 						| (u32)data[1], 13), 16384);
 	return 0;
 }
@@ -4415,7 +4431,10 @@ static int cxd2841er_sleep_tc_to_active_c(struct cxd2841er_priv *priv,
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x41, 0x1a);
 	if (ret)
 		return ret;
-	/* xtal freq 20.5MHz */
+	if (priv->xtal == SONY_XTAL_41000) {
+		data[0] = 0x0a;
+		data[1] = 0xd4;
+	}
 	ret = cxd2841er_write_regs(priv, I2C_SLVT, 0x43, data, 2);
 	if (ret)
 		return ret;
@@ -4576,7 +4595,14 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 			priv, p->delivery_system, symbol_rate);
 		break;
 	case STATE_ACTIVE_S:
-		ret = cxd2841er_retune_active(priv, p);
+		if (priv->system != p->delivery_system) {
+			ret = cxd2841er_active_s_to_sleep_s(priv);
+			if (!ret)
+				ret = cxd2841er_sleep_s_to_active_s(
+					priv, p->delivery_system, symbol_rate);
+		} else {
+			ret = cxd2841er_retune_active(priv, p);
+		}
 		break;
 	default:
 		dev_dbg(&priv->i2c->dev, "%s(): invalid state %d\n",
