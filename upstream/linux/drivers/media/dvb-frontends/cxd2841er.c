@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.3"
+#define CXD2841ER_VERSION "1.1.4"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -2557,7 +2557,7 @@ static void cxd2841er_read_ber(struct dvb_frontend *fe)
 	int ret;
 
 	if (p->delivery_system == SYS_DVBT || p->delivery_system == SYS_DVBT2 ||
-	    p->delivery_system == SYS_DVBS2) {
+	    p->delivery_system == SYS_DVBS || p->delivery_system == SYS_DVBS2) {
 		error = &p->pre_bit_error;
 		count = &p->pre_bit_count;
 	}
@@ -5159,12 +5159,12 @@ static void cxd2841er_init_stats(struct dvb_frontend *fe)
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	bool pre = p->delivery_system == SYS_DVBT ||
-		p->delivery_system == SYS_DVBT2 || p->delivery_system == SYS_DVBS2;
+		p->delivery_system == SYS_DVBT2 ||
+		p->delivery_system == SYS_DVBS || p->delivery_system == SYS_DVBS2;
 	bool cable = p->delivery_system == SYS_DVBC_ANNEX_A ||
 		p->delivery_system == SYS_DVBC_ANNEX_B ||
 		p->delivery_system == SYS_DVBC_ANNEX_C;
-	bool post = cable || p->delivery_system == SYS_ISDBT ||
-		p->delivery_system == SYS_DVBS;
+	bool post = cable || p->delivery_system == SYS_ISDBT;
 
 	priv->stats_time = 0;
 	memset(&p->strength, 0, sizeof(p->strength));
