@@ -33,18 +33,25 @@ int dib0700_get_version(struct dvb_usb_device *d, u32 *hwversion,
 				  REQUEST_GET_VERSION,
 				  USB_TYPE_VENDOR | USB_DIR_IN, 0, 0,
 				  st->buf, 16, USB_CTRL_GET_TIMEOUT);
+	if (ret < 0)
+		goto unlock;
+	if (ret != 16) {
+		ret = -EIO;
+		goto unlock;
+	}
 	if (hwversion != NULL)
-		*hwversion  = (st->buf[0] << 24)  | (st->buf[1] << 16)  |
+		*hwversion  = ((u32)st->buf[0] << 24) | (st->buf[1] << 16) |
 			(st->buf[2] << 8)  | st->buf[3];
 	if (romversion != NULL)
-		*romversion = (st->buf[4] << 24)  | (st->buf[5] << 16)  |
+		*romversion = ((u32)st->buf[4] << 24) | (st->buf[5] << 16) |
 			(st->buf[6] << 8)  | st->buf[7];
 	if (ramversion != NULL)
-		*ramversion = (st->buf[8] << 24)  | (st->buf[9] << 16)  |
+		*ramversion = ((u32)st->buf[8] << 24) | (st->buf[9] << 16) |
 			(st->buf[10] << 8) | st->buf[11];
 	if (fwtype != NULL)
-		*fwtype     = (st->buf[12] << 24) | (st->buf[13] << 16) |
+		*fwtype     = ((u32)st->buf[12] << 24) | (st->buf[13] << 16) |
 			(st->buf[14] << 8) | st->buf[15];
+unlock:
 	mutex_unlock(&d->usb_mutex);
 	return ret;
 }
@@ -64,7 +71,9 @@ static int dib0700_ctrl_wr(struct dvb_usb_device *d, u8 *tx, u8 txlen)
 	if (status != txlen)
 		deb_data("ep 0 write error (status = %d, len: %d)\n",status,txlen);
 
-	return status < 0 ? status : 0;
+	if (status < 0)
+		return status;
+	return status == txlen ? 0 : -EIO;
 }
 
 /* expecting tx buffer: request data[0] ... data[n] (n <= 4) */
@@ -474,10 +483,12 @@ int dib0700_set_i2c_speed(struct dvb_usb_device *d, u16 scl_kHz)
 int dib0700_ctrl_clock(struct dvb_usb_device *d, u32 clk_MHz, u8 clock_out_gp3)
 {
 	switch (clk_MHz) {
-		case 72: dib0700_set_clock(d, 1, 0, 1, clock_out_gp3, 2, 24, 0, 0x4c); break;
-		default: return -EINVAL;
+	case 72:
+		return dib0700_set_clock(d, 1, 0, 1, clock_out_gp3,
+					2, 24, 0, 0x4c);
+	default:
+		return -EINVAL;
 	}
-	return 0;
 }
 
 static int dib0700_jumpram(struct usb_device *udev, u32 address)
@@ -880,10 +891,12 @@ int dib0700_rc_setup(struct dvb_usb_device *d, struct usb_interface *intf)
 	return ret;
 }
 
+static void dib0700_disconnect(struct usb_interface *intf);
+
 static int dib0700_probe(struct usb_interface *intf,
 		const struct usb_device_id *id)
 {
-	int i;
+	int i, ret;
 	struct dvb_usb_device *dev;
 
 	for (i = 0; i < dib0700_device_count; i++)
@@ -892,8 +905,12 @@ static int dib0700_probe(struct usb_interface *intf,
 			struct dib0700_state *st = dev->priv;
 			u32 hwversion, romversion, fw_version, fwtype;
 
-			dib0700_get_version(dev, &hwversion, &romversion,
-				&fw_version, &fwtype);
+			ret = dib0700_get_version(dev, &hwversion, &romversion,
+						  &fw_version, &fwtype);
+			if (ret < 0) {
+				dib0700_disconnect(intf);
+				return ret;
+			}
 
 			deb_info("Firmware version: %x, %d, 0x%x, %d\n",
 				hwversion, romversion, fw_version, fwtype);

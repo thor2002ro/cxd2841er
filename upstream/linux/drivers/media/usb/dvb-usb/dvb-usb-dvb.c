@@ -14,7 +14,8 @@
 static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 {
 	struct dvb_usb_adapter *adap = dvbdmxfeed->demux->priv;
-	int newfeedcount, ret;
+	int newfeedcount, ret = 0, rollback_ret;
+	bool pid_filter, pid_parser;
 
 	if (adap == NULL)
 		return -ENODEV;
@@ -23,6 +24,16 @@ static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 	    (adap->active_fe >= adap->num_frontends_initialized)) {
 		return -EINVAL;
 	}
+
+	pid_filter = adap->props.fe[adap->active_fe].caps &
+		DVB_USB_ADAP_HAS_PID_FILTER &&
+		adap->fe_adap[adap->active_fe].pid_filtering &&
+		adap->props.fe[adap->active_fe].pid_filter;
+	pid_parser = adap->props.fe[adap->active_fe].caps &
+		DVB_USB_ADAP_HAS_PID_FILTER &&
+		adap->props.fe[adap->active_fe].caps &
+		DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF &&
+		adap->props.fe[adap->active_fe].pid_filter_ctrl;
 
 	newfeedcount = adap->feedcount + (onoff ? 1 : -1);
 
@@ -33,10 +44,8 @@ static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 
 		if (adap->props.fe[adap->active_fe].streaming_ctrl != NULL) {
 			ret = adap->props.fe[adap->active_fe].streaming_ctrl(adap, 0);
-			if (ret < 0) {
+			if (ret < 0)
 				err("error while stopping stream.");
-				return ret;
-			}
 		}
 	}
 
@@ -47,9 +56,7 @@ static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 		adap->fe_adap[adap->active_fe].pid_filtering ?
 		"yes" : "no", dvbdmxfeed->pid, dvbdmxfeed->pid,
 		dvbdmxfeed->index, onoff ? "on" : "off");
-	if (adap->props.fe[adap->active_fe].caps & DVB_USB_ADAP_HAS_PID_FILTER &&
-		adap->fe_adap[adap->active_fe].pid_filtering &&
-		adap->props.fe[adap->active_fe].pid_filter != NULL)
+	if (pid_filter)
 		adap->props.fe[adap->active_fe].pid_filter(adap, dvbdmxfeed->index, dvbdmxfeed->pid, onoff);
 
 	/* start the feed if this was the first feed and there is still a feed
@@ -57,15 +64,12 @@ static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 	 */
 	if (adap->feedcount == onoff && adap->feedcount > 0) {
 		deb_ts("controlling pid parser\n");
-		if (adap->props.fe[adap->active_fe].caps & DVB_USB_ADAP_HAS_PID_FILTER &&
-			adap->props.fe[adap->active_fe].caps &
-			DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF &&
-			adap->props.fe[adap->active_fe].pid_filter_ctrl != NULL) {
+		if (pid_parser) {
 			ret = adap->props.fe[adap->active_fe].pid_filter_ctrl(adap,
 				adap->fe_adap[adap->active_fe].pid_filtering);
 			if (ret < 0) {
 				err("could not handle pid_parser");
-				return ret;
+				goto rollback_parser;
 			}
 		}
 		deb_ts("start feeding\n");
@@ -73,14 +77,37 @@ static int dvb_usb_ctrl_feed(struct dvb_demux_feed *dvbdmxfeed, int onoff)
 			ret = adap->props.fe[adap->active_fe].streaming_ctrl(adap, 1);
 			if (ret < 0) {
 				err("error while enabling fifo.");
-				return ret;
+				goto rollback_stream;
 			}
 		}
 
 		deb_ts("submitting all URBs\n");
-		usb_urb_submit(&adap->fe_adap[adap->active_fe].stream);
+		ret = usb_urb_submit(&adap->fe_adap[adap->active_fe].stream);
+		if (ret < 0)
+			goto rollback_stream;
 	}
-	return 0;
+	return ret < 0 ? ret : 0;
+
+rollback_stream:
+	if (adap->props.fe[adap->active_fe].streaming_ctrl) {
+		rollback_ret = adap->props.fe[adap->active_fe].streaming_ctrl(adap, 0);
+		if (rollback_ret < 0)
+			err("error while rolling back stream: %d", rollback_ret);
+	}
+rollback_parser:
+	if (pid_parser) {
+		rollback_ret = adap->props.fe[adap->active_fe].pid_filter_ctrl(adap, 0);
+		if (rollback_ret < 0)
+			err("error while rolling back pid parser: %d", rollback_ret);
+	}
+	if (pid_filter) {
+		rollback_ret = adap->props.fe[adap->active_fe].pid_filter(adap,
+			dvbdmxfeed->index, dvbdmxfeed->pid, 0);
+		if (rollback_ret < 0)
+			err("error while rolling back pid filter: %d", rollback_ret);
+	}
+	adap->feedcount--;
+	return ret;
 }
 
 static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)

@@ -2139,11 +2139,15 @@ static int tfe8096p_frontend_attach(struct dvb_usb_adapter *adap)
 	struct dib0700_state *st = adap->dev->priv;
 	u32 fw_version;
 	struct dib0700_adapter_state *state = adap->priv;
+	int ret;
+
+	ret = dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
+	if (ret < 0)
+		return ret;
 
 	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
 		return -ENODEV;
 
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
 	if (fw_version >= 0x10200)
 		st->fw_use_new_i2c_api = 1;
 
@@ -2378,9 +2382,12 @@ static int stk9090m_frontend_attach(struct dvb_usb_adapter *adap)
 	struct dib0700_adapter_state *state = adap->priv;
 	struct dib0700_state *st = adap->dev->priv;
 	u32 fw_version;
+	int ret;
 
 	/* Make use of the new i2c functions from FW 1.20 */
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
+	ret = dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
+	if (ret < 0)
+		return ret;
 	if (fw_version >= 0x10200)
 		st->fw_use_new_i2c_api = 1;
 	dib0700_set_i2c_speed(adap->dev, 340);
@@ -2455,9 +2462,12 @@ static int nim9090md_frontend_attach(struct dvb_usb_adapter *adap)
 	struct i2c_adapter *i2c;
 	struct dvb_frontend *fe_slave;
 	u32 fw_version;
+	int ret;
 
 	/* Make use of the new i2c functions from FW 1.20 */
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
+	ret = dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
+	if (ret < 0)
+		return ret;
 	if (fw_version >= 0x10200)
 		st->fw_use_new_i2c_api = 1;
 	dib0700_set_i2c_speed(adap->dev, 340);
@@ -3752,17 +3762,27 @@ static int xbox_one_attach(struct dvb_usb_adapter *adap)
 	st->disable_streaming_master_mode = 1;
 
 	/* fe power enable */
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
+	ret = dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
+	if (ret)
+		return ret;
 	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
+	ret = dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
+	if (ret)
+		return ret;
 	msleep(30);
 
 	/* demod reset */
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
+	ret = dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
+	if (ret)
+		return ret;
 	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
+	ret = dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
+	if (ret)
+		return ret;
 	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
+	ret = dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
+	if (ret)
+		return ret;
 	msleep(30);
 
 	/* attach demod */
