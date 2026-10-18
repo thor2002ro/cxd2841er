@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.7"
+#define CXD2841ER_VERSION "1.1.9"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -2338,6 +2338,13 @@ static int cxd2841er_read_snr_c(struct cxd2841er_priv *priv, s32 *snr)
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x40);
 	if (ret)
 		goto unfreeze;
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x88, data);
+	if (ret)
+		goto unfreeze;
+	if (!(data[0] & 0x01)) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x19, data, 1);
 	if (ret)
 		goto unfreeze;
@@ -2406,6 +2413,13 @@ static int cxd2841er_read_snr_t(struct cxd2841er_priv *priv, s32 *snr)
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x10);
 	if (ret)
 		goto unfreeze;
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x10, data);
+	if (ret)
+		goto unfreeze;
+	if ((data[0] & 0x07) != 0x06) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x28, data, sizeof(data));
 	if (ret)
 		goto unfreeze;
@@ -2452,6 +2466,13 @@ static int cxd2841er_read_snr_t2(struct cxd2841er_priv *priv, s32 *snr)
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x20);
 	if (ret)
 		goto unfreeze;
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x10, data);
+	if (ret)
+		goto unfreeze;
+	if ((data[0] & 0x07) != 0x06) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x28, data, sizeof(data));
 	if (ret)
 		goto unfreeze;
@@ -2520,7 +2541,7 @@ unfreeze:
 				"%s(): reg value out of range\n", __func__);
 		return -EINVAL;
 	}
-	*snr = 10000 * (s32)(intlog10(reg) >> 24) - 9031;
+	*snr = (s32)(((u64)intlog10(reg) * 10000) >> 24) - 9031;
 	return 0;
 }
 
@@ -4590,7 +4611,11 @@ static int cxd2841er_sleep_tc_to_active_c(struct cxd2841er_priv *priv,
 static int cxd2841er_get_frontend(struct dvb_frontend *fe,
                                   struct dtv_frontend_properties *p)
 {
-	int ret = 0;
+	static const enum fe_modulation qam[] = {
+		QAM_16, QAM_32, QAM_64, QAM_128, QAM_256
+	};
+	int ret = 0, unfreeze_ret;
+	u8 arlock, constellation = 0xff;
 	enum fe_status status = 0;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
@@ -4633,7 +4658,36 @@ copy:
 	p->pre_bit_count = c->pre_bit_count;
 	p->post_bit_error = c->post_bit_error;
 	p->post_bit_count = c->post_bit_count;
-	return ret;
+	if (!(status & FE_HAS_LOCK) || priv->system != SYS_DVBC_ANNEX_A ||
+	    (c->delivery_system != SYS_DVBC_ANNEX_A &&
+	     c->delivery_system != SYS_DVBC_ANNEX_C))
+		return ret;
+
+	ret = cxd2841er_freeze_regs(priv);
+	if (ret)
+		return ret;
+	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x40);
+	if (ret)
+		goto unfreeze_qam;
+	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x88, &arlock);
+	if (ret)
+		goto unfreeze_qam;
+	if (arlock & 0x01)
+		ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x19, &constellation);
+unfreeze_qam:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
+	if (unfreeze_ret)
+		dev_warn_ratelimited(&priv->i2c->dev,
+			"%s(): QAM snapshot release failed: ret=%d, read ret=%d\n",
+			__func__, unfreeze_ret, ret);
+	if (ret)
+		return ret;
+	if (unfreeze_ret)
+		return unfreeze_ret;
+	constellation &= 0x07;
+	if (constellation < ARRAY_SIZE(qam))
+		p->modulation = qam[constellation];
+	return 0;
 }
 
 static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
