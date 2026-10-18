@@ -244,6 +244,12 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		TRANSMISSION_MODE_2K, TRANSMISSION_MODE_8K,
 		TRANSMISSION_MODE_4K, TRANSMISSION_MODE_AUTO,
 	};
+	static const enum fe_transmit_mode t2_transmission_mode[] = {
+		TRANSMISSION_MODE_1K, TRANSMISSION_MODE_2K,
+		TRANSMISSION_MODE_4K, TRANSMISSION_MODE_8K,
+		TRANSMISSION_MODE_16K, TRANSMISSION_MODE_32K,
+		TRANSMISSION_MODE_AUTO, TRANSMISSION_MODE_AUTO,
+	};
 	static const enum fe_guard_interval guard_interval[] = {
 		GUARD_INTERVAL_1_32, GUARD_INTERVAL_1_16,
 		GUARD_INTERVAL_1_8, GUARD_INTERVAL_1_4,
@@ -255,6 +261,19 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	if (!dev->active)
 		return 0;
 
+	if (c->delivery_system == SYS_DVBT2) {
+		ret = regmap_read(dev->regmap[2], 0x92, &utmp);
+		if (ret)
+			goto err;
+		if ((utmp & 0x40) || (utmp & 0x0f) < 13)
+			return 0;
+		ret = regmap_read(dev->regmap[2], 0x93, &utmp);
+		if (ret)
+			goto err;
+
+		c->transmission_mode = t2_transmission_mode[utmp & 0x07];
+		return 0;
+	}
 	if (c->delivery_system == SYS_DVBC_ANNEX_A) {
 		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
 		if (ret)
