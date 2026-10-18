@@ -220,6 +220,61 @@ err:
 	return ret;
 }
 
+static int mn88472_get_frontend(struct dvb_frontend *fe,
+				struct dtv_frontend_properties *c)
+{
+	struct i2c_client *client = fe->demodulator_priv;
+	struct mn88472_dev *dev = i2c_get_clientdata(client);
+	static const enum fe_modulation modulation[] = {
+		QPSK, QAM_16, QAM_64, QAM_AUTO,
+	};
+	static const enum fe_hierarchy hierarchy[] = {
+		HIERARCHY_NONE, HIERARCHY_1, HIERARCHY_2, HIERARCHY_4,
+		HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO,
+	};
+	static const enum fe_code_rate code_rate[] = {
+		FEC_1_2, FEC_2_3, FEC_3_4, FEC_5_6, FEC_7_8,
+		FEC_AUTO, FEC_AUTO, FEC_AUTO,
+	};
+	static const enum fe_transmit_mode transmission_mode[] = {
+		TRANSMISSION_MODE_2K, TRANSMISSION_MODE_8K,
+		TRANSMISSION_MODE_4K, TRANSMISSION_MODE_AUTO,
+	};
+	static const enum fe_guard_interval guard_interval[] = {
+		GUARD_INTERVAL_1_32, GUARD_INTERVAL_1_16,
+		GUARD_INTERVAL_1_8, GUARD_INTERVAL_1_4,
+	};
+	unsigned int utmp;
+	u8 buf[3];
+	int ret;
+
+	if (!dev->active || c->delivery_system != SYS_DVBT)
+		return 0;
+
+	ret = regmap_read(dev->regmap[0], 0x7f, &utmp);
+	if (ret)
+		goto err;
+	if ((utmp & 0xa0) || (utmp & 0x0f) < 9)
+		return 0;
+
+	/* Read decoded TPS only; status sampling also accumulates counters. */
+	ret = regmap_bulk_read(dev->regmap[0], 0x89, buf, sizeof(buf));
+	if (ret)
+		goto err;
+
+	c->modulation = modulation[(buf[0] >> 3) & 0x03];
+	c->hierarchy = hierarchy[buf[0] & 0x07];
+	c->code_rate_HP = code_rate[(buf[1] >> 3) & 0x07];
+	c->code_rate_LP = code_rate[buf[1] & 0x07];
+	c->transmission_mode = transmission_mode[buf[2] & 0x03];
+	c->guard_interval = guard_interval[(buf[2] >> 2) & 0x03];
+
+	return 0;
+err:
+	dev_dbg(&client->dev, "failed=%d\n", ret);
+	return ret;
+}
+
 static int mn88472_set_frontend(struct dvb_frontend *fe)
 {
 	struct i2c_client *client = fe->demodulator_priv;
@@ -607,6 +662,7 @@ static const struct dvb_frontend_ops mn88472_ops = {
 	.sleep = mn88472_sleep,
 
 	.set_frontend = mn88472_set_frontend,
+	.get_frontend = mn88472_get_frontend,
 
 	.read_status = mn88472_read_status,
 };
