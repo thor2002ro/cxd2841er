@@ -403,6 +403,7 @@ static int mn88472_init(struct dvb_frontend *fe)
 	dev_dbg(&client->dev, "\n");
 
 	/* Power up */
+	dev->active = false;
 	ret = regmap_write(dev->regmap[2], 0x05, 0x00);
 	if (ret)
 		goto err;
@@ -510,6 +511,7 @@ static int mn88472_sleep(struct dvb_frontend *fe)
 	dev_dbg(&client->dev, "\n");
 
 	/* Power down */
+	dev->active = false;
 	ret = regmap_write(dev->regmap[2], 0x0c, 0x30);
 	if (ret)
 		goto err;
