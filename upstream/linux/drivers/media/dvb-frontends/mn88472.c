@@ -336,6 +336,7 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 	u8 reg_bank0_b4_val, reg_bank0_cd_val, reg_bank0_d4_val;
 	u8 reg_bank0_d6_val;
 	u8 reg_bank0_00_val, reg_bank0_01_val;
+	u8 reg_bank1_00_val;
 
 	dev_dbg(&client->dev,
 		"delivery_system=%u modulation=%u frequency=%u bandwidth_hz=%u symbol_rate=%u inversion=%d stream_id=%d\n",
@@ -520,6 +521,31 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 			goto err;
 		break;
 	case SYS_DVBC_ANNEX_A:
+		switch (c->modulation) {
+		case QAM_16:
+			reg_bank1_00_val = 0x0c;
+			break;
+		case QAM_32:
+			reg_bank1_00_val = 0x0b;
+			break;
+		case QAM_64:
+			reg_bank1_00_val = 0x08;
+			break;
+		case QAM_128:
+			reg_bank1_00_val = 0x0a;
+			break;
+		case QAM_256:
+			reg_bank1_00_val = 0x09;
+			break;
+		default:
+			reg_bank1_00_val = 0x00;
+			break;
+		}
+		/* Replace the whole field so retunes can return to automatic search. */
+		ret = regmap_update_bits(dev->regmap[1], 0x00, 0x0f,
+					 reg_bank1_00_val);
+		if (ret)
+			goto err;
 		break;
 	default:
 		break;
