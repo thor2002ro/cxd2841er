@@ -5,6 +5,8 @@
  * Copyright (C) 2013 Antti Palosaari <crope@iki.fi>
  */
 
+#include <linux/limits.h>
+
 #include "mn88472_priv.h"
 
 static int mn88472_get_tune_settings(struct dvb_frontend *fe,
@@ -22,6 +24,12 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	int ret, i, stmp;
 	unsigned int utmp, utmp1, utmp2;
 	u8 buf[5];
+
+	*status = 0;
+	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 
 	if (!dev->active) {
 		ret = -EAGAIN;
@@ -59,7 +67,6 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 			*status = 0;
 		break;
 	case SYS_DVBC_ANNEX_A:
-		*status = 0;
 		/* QAM errors or missing VQLOCK invalidate the acquisition stage. */
 		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
 		if (ret)
@@ -94,7 +101,8 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 				goto err;
 		}
 
-		utmp1 = buf[0] << 8 | buf[1] << 0 | buf[0] >> 2;
+		/* The ten-bit AGC monitor is MSB-aligned across both registers. */
+		utmp1 = buf[0] << 8 | (buf[1] & 0xc0) | buf[0] >> 2;
 		dev_dbg(&client->dev, "strength=%u\n", utmp1);
 
 		c->strength.stat[0].scale = FE_SCALE_RELATIVE;
@@ -287,7 +295,7 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		}
 		break;
 	case SYS_DVBC_ANNEX_A:
-		bandwidth_vals_ptr = NULL;
+		bandwidth_vals_ptr = "\x8f\x80\x00\x08\xee\x08\xee";
 		bandwidth_val = 0x00;
 		break;
 	default:
@@ -349,6 +357,11 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		}
 	}
 
+	ret = regmap_write(dev->regmap[0], 0x46,
+			   (c->delivery_system == SYS_DVBT &&
+			    c->bandwidth_hz == 7000000) ? 0x10 : 0x00);
+	if (ret)
+		goto err;
 	ret = regmap_write(dev->regmap[0], 0xb4, reg_bank0_b4_val);
 	if (ret)
 		goto err;
@@ -385,7 +398,7 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		if (ret)
 			goto err;
 		ret = regmap_write(dev->regmap[2], 0x32,
-				(c->stream_id == NO_STREAM_ID_FILTER) ? 0 :
+				(c->stream_id > 0xff) ? 0 :
 				c->stream_id );
 		if (ret)
 			goto err;
@@ -411,6 +424,7 @@ static int mn88472_init(struct dvb_frontend *fe)
 {
 	struct i2c_client *client = fe->demodulator_priv;
 	struct mn88472_dev *dev = i2c_get_clientdata(client);
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret, len, rem;
 	unsigned int utmp;
 	const struct firmware *firmware;
@@ -420,6 +434,10 @@ static int mn88472_init(struct dvb_frontend *fe)
 
 	/* Power up */
 	dev->active = false;
+	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	ret = regmap_write(dev->regmap[2], 0x05, 0x00);
 	if (ret)
 		goto err;
@@ -445,6 +463,12 @@ static int mn88472_init(struct dvb_frontend *fe)
 
 	dev_info(&client->dev, "downloading firmware from file '%s'\n", name);
 
+	if (!firmware->size || firmware->size > INT_MAX ||
+	    dev->i2c_write_max < 2) {
+		ret = -EINVAL;
+		goto err_release_firmware;
+	}
+
 	ret = regmap_write(dev->regmap[0], 0xf5, 0x03);
 	if (ret)
 		goto err_release_firmware;
@@ -468,7 +492,7 @@ static int mn88472_init(struct dvb_frontend *fe)
 		goto err_release_firmware;
 	if (utmp & 0x10) {
 		ret = -EINVAL;
-		dev_err(&client->dev, "firmware did not run\n");
+		dev_err(&client->dev, "firmware parity check failed\n");
 		goto err_release_firmware;
 	}
 
@@ -523,12 +547,17 @@ static int mn88472_sleep(struct dvb_frontend *fe)
 {
 	struct i2c_client *client = fe->demodulator_priv;
 	struct mn88472_dev *dev = i2c_get_clientdata(client);
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret;
 
 	dev_dbg(&client->dev, "\n");
 
 	/* Power down */
 	dev->active = false;
+	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	ret = regmap_write(dev->regmap[2], 0x0c, 0x30);
 	if (ret)
 		goto err;
@@ -604,6 +633,15 @@ static int mn88472_probe(struct i2c_client *client)
 	};
 
 	dev_dbg(&client->dev, "\n");
+
+	if (!pdata || !pdata->fe || !pdata->xtal || pdata->i2c_wr_max == 1 ||
+	    (pdata->ts_mode != SERIAL_TS_MODE &&
+	     pdata->ts_mode != PARALLEL_TS_MODE) ||
+	    (pdata->ts_clock != FIXED_TS_CLOCK &&
+	     pdata->ts_clock != VARIABLE_TS_CLOCK)) {
+		ret = -EINVAL;
+		goto err;
+	}
 
 	dev = kzalloc_obj(*dev);
 	if (!dev) {
