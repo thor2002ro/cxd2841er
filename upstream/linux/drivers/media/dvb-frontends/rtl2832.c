@@ -438,8 +438,11 @@ static int rtl2832_set_frontend(struct dvb_frontend *fe)
 		c->frequency, c->bandwidth_hz, c->inversion);
 
 	/* program tuner */
-	if (fe->ops.tuner_ops.set_params)
-		fe->ops.tuner_ops.set_params(fe);
+	if (fe->ops.tuner_ops.set_params) {
+		ret = fe->ops.tuner_ops.set_params(fe);
+		if (ret)
+			goto err;
+	}
 
 	/* If the frontend has get_if_frequency(), use it */
 	if (fe->ops.tuner_ops.get_if_frequency) {

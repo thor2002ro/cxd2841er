@@ -342,9 +342,11 @@ int dvb_usb_adapter_frontend_exit(struct dvb_usb_adapter *adap)
 		if (adap->fe_adap[i].fe != NULL) {
 			dvb_unregister_frontend(adap->fe_adap[i].fe);
 			dvb_frontend_detach(adap->fe_adap[i].fe);
+			adap->fe_adap[i].fe = NULL;
 		}
 	}
 	adap->num_frontends_initialized = 0;
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(dvb_usb_adapter_frontend_exit);

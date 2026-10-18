@@ -10,10 +10,9 @@
 
 static const struct dvb_tuner_ops tda18250_ops;
 
-static int tda18250_power_control(struct dvb_frontend *fe,
+static int tda18250_power_control(struct i2c_client *client,
 		unsigned int power_state)
 {
-	struct i2c_client *client = fe->tuner_priv;
 	struct tda18250_dev *dev = i2c_get_clientdata(client);
 	int ret;
 	unsigned int utmp;
@@ -173,7 +172,7 @@ static int tda18250_init(struct dvb_frontend *fe)
 
 	dev_dbg(&client->dev, "\n");
 
-	ret = tda18250_power_control(fe, TDA18250_POWER_NORMAL);
+	ret = tda18250_power_control(client, TDA18250_POWER_NORMAL);
 	if (ret)
 		goto err;
 
@@ -694,7 +693,7 @@ static int tda18250_set_params(struct dvb_frontend *fe)
 	/* charge pump */
 	ret = regmap_write_bits(dev->regmap, R46_CPUMP, 0x07, buf[2]);
 
-	return 0;
+	return ret;
 err:
 	return ret;
 }
@@ -724,7 +723,7 @@ static int tda18250_sleep(struct dvb_frontend *fe)
 	/* set if freq to 0 in order to make sure it's set after wake up */
 	dev->if_frequency = 0;
 
-	ret = tda18250_power_control(fe, TDA18250_POWER_STANDBY);
+	ret = tda18250_power_control(client, TDA18250_POWER_STANDBY);
 	return ret;
 }
 
@@ -744,7 +743,7 @@ static const struct dvb_tuner_ops tda18250_ops = {
 static int tda18250_probe(struct i2c_client *client)
 {
 	struct tda18250_config *cfg = client->dev.platform_data;
-	struct dvb_frontend *fe = cfg->fe;
+	struct dvb_frontend *fe;
 	struct tda18250_dev *dev;
 	int ret;
 	unsigned char chip_id[3];
@@ -768,6 +767,10 @@ static int tda18250_probe(struct i2c_client *client)
 		.max_register = TDA18250_NUM_REGS - 1,
 		.volatile_table = &tda18250_volatile_table,
 	};
+
+	if (!cfg || !cfg->fe)
+		return -EINVAL;
+	fe = cfg->fe;
 
 	dev = kzalloc_obj(*dev);
 	if (!dev) {
@@ -803,7 +806,9 @@ static int tda18250_probe(struct i2c_client *client)
 	}
 
 	/* read the three chip ID registers */
-	regmap_bulk_read(dev->regmap, R00_ID1, &chip_id, 3);
+	ret = regmap_bulk_read(dev->regmap, R00_ID1, &chip_id, 3);
+	if (ret)
+		goto err_kfree;
 	dev_dbg(&client->dev, "chip_id=%02x:%02x:%02x",
 			chip_id[0], chip_id[1], chip_id[2]);
 
@@ -840,15 +845,18 @@ static int tda18250_probe(struct i2c_client *client)
 		goto err_kfree;
 	}
 
+	/* put the tuner in standby */
+	ret = tda18250_power_control(client, TDA18250_POWER_STANDBY);
+	if (ret)
+		goto err_kfree;
+
 	fe->tuner_priv = client;
 	memcpy(&fe->ops.tuner_ops, &tda18250_ops,
 			sizeof(struct dvb_tuner_ops));
 
-	/* put the tuner in standby */
-	tda18250_power_control(fe, TDA18250_POWER_STANDBY);
-
 	return 0;
 err_kfree:
+	i2c_set_clientdata(client, NULL);
 	kfree(dev);
 err:
 	dev_dbg(&client->dev, "failed=%d", ret);

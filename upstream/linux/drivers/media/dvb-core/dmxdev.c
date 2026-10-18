@@ -50,13 +50,17 @@ static int dvb_dmxdev_buffer_write(struct dvb_ringbuffer *buf,
 	return dvb_ringbuffer_write(buf, src, len);
 }
 
-static ssize_t dvb_dmxdev_buffer_read(struct dvb_ringbuffer *src,
+static ssize_t dvb_dmxdev_buffer_read(struct dmxdev *dmxdev,
+				      struct dvb_ringbuffer *src,
 				      int non_blocking, char __user *buf,
 				      size_t count, loff_t *ppos)
 {
 	size_t todo;
 	ssize_t avail;
 	ssize_t ret = 0;
+
+	if (dmxdev->exit)
+		return -ENODEV;
 
 	if (!src->data)
 		return 0;
@@ -68,16 +72,25 @@ static ssize_t dvb_dmxdev_buffer_read(struct dvb_ringbuffer *src,
 	}
 
 	for (todo = count; todo > 0; todo -= ret) {
+		if (dmxdev->exit) {
+			ret = -ENODEV;
+			break;
+		}
 		if (non_blocking && dvb_ringbuffer_empty(src)) {
 			ret = -EWOULDBLOCK;
 			break;
 		}
 
 		ret = wait_event_interruptible(src->queue,
+					       dmxdev->exit ||
 					       !dvb_ringbuffer_empty(src) ||
 					       (src->error != 0));
 		if (ret < 0)
 			break;
+		if (dmxdev->exit) {
+			ret = -ENODEV;
+			break;
+		}
 
 		if (src->error) {
 			ret = src->error;
@@ -274,7 +287,7 @@ static ssize_t dvb_dvr_read(struct file *file, char __user *buf, size_t count,
 	if (dmxdev->exit)
 		return -ENODEV;
 
-	return dvb_dmxdev_buffer_read(&dmxdev->dvr_buffer,
+	return dvb_dmxdev_buffer_read(dmxdev, &dmxdev->dvr_buffer,
 				      file->f_flags & O_NONBLOCK,
 				      buf, count, ppos);
 }
@@ -818,18 +831,7 @@ static int dvb_demux_open(struct inode *inode, struct file *file)
 	dmxdev->may_do_mmap = 0;
 #endif
 
-	/*
-	 * The mutex passed to dvb_vb2_init is unlocked when a buffer
-	 * is in a blocking wait. However, dmxdevfilter has two mutexes:
-	 * dmxdevfilter->mutex and dmxdev->mutex. So this will not work.
-	 * The solution would be to support unlocking two mutexes in vb2,
-	 * but since this problem has been here since the beginning and
-	 * nobody ever complained, we leave it as-is rather than adding
-	 * that second mutex pointer to vb2.
-	 *
-	 * In the unlikely event that someone complains about this, then
-	 * this comment will hopefully help.
-	 */
+	/* DQBUF holds only this mutex, which vb2 drops while waiting. */
 	dvb_ringbuffer_init(&dmxdevfilter->buffer, NULL, 8192);
 	dvb_vb2_init(&dmxdevfilter->vb2_ctx, "demux_filter",
 		     &dmxdevfilter->mutex, file->f_flags & O_NONBLOCK);
@@ -998,7 +1000,7 @@ static ssize_t dvb_dmxdev_read_sec(struct dmxdev_filter *dfil,
 		hcount = 3 + dfil->todo;
 		if (hcount > count)
 			hcount = count;
-		result = dvb_dmxdev_buffer_read(&dfil->buffer,
+		result = dvb_dmxdev_buffer_read(dfil->dev, &dfil->buffer,
 						file->f_flags & O_NONBLOCK,
 						buf, hcount, ppos);
 		if (result < 0) {
@@ -1019,7 +1021,7 @@ static ssize_t dvb_dmxdev_read_sec(struct dmxdev_filter *dfil,
 	}
 	if (count > dfil->todo)
 		count = dfil->todo;
-	result = dvb_dmxdev_buffer_read(&dfil->buffer,
+	result = dvb_dmxdev_buffer_read(dfil->dev, &dfil->buffer,
 					file->f_flags & O_NONBLOCK,
 					buf, count, ppos);
 	if (result < 0)
@@ -1041,7 +1043,7 @@ dvb_demux_read(struct file *file, char __user *buf, size_t count,
 	if (dmxdevfilter->type == DMXDEV_TYPE_SEC)
 		ret = dvb_dmxdev_read_sec(dmxdevfilter, file, buf, count, ppos);
 	else
-		ret = dvb_dmxdev_buffer_read(&dmxdevfilter->buffer,
+		ret = dvb_dmxdev_buffer_read(dmxdevfilter->dev, &dmxdevfilter->buffer,
 					     file->f_flags & O_NONBLOCK,
 					     buf, count, ppos);
 
@@ -1056,6 +1058,20 @@ static int dvb_demux_do_ioctl(struct file *file,
 	struct dmxdev *dmxdev = dmxdevfilter->dev;
 	unsigned long arg = (unsigned long)parg;
 	int ret = 0;
+
+#ifdef CONFIG_DVB_MMAP
+	/* A blocking dequeue must not hold the disconnect mutex. */
+	if (cmd == DMX_DQBUF) {
+		if (mutex_lock_interruptible(&dmxdevfilter->mutex))
+			return -ERESTARTSYS;
+		if (dmxdev->exit)
+			ret = -ENODEV;
+		else
+			ret = dvb_vb2_dqbuf(&dmxdevfilter->vb2_ctx, parg);
+		mutex_unlock(&dmxdevfilter->mutex);
+		return ret;
+	}
+#endif
 
 	if (mutex_lock_interruptible(&dmxdev->mutex))
 		return -ERESTARTSYS;
@@ -1185,14 +1201,6 @@ static int dvb_demux_do_ioctl(struct file *file,
 		mutex_unlock(&dmxdevfilter->mutex);
 		break;
 
-	case DMX_DQBUF:
-		if (mutex_lock_interruptible(&dmxdevfilter->mutex)) {
-			mutex_unlock(&dmxdev->mutex);
-			return -ERESTARTSYS;
-		}
-		ret = dvb_vb2_dqbuf(&dmxdevfilter->vb2_ctx, parg);
-		mutex_unlock(&dmxdevfilter->mutex);
-		break;
 #endif
 	default:
 		ret = -ENOTTY;
@@ -1457,8 +1465,24 @@ EXPORT_SYMBOL(dvb_dmxdev_init);
 
 void dvb_dmxdev_release(struct dmxdev *dmxdev)
 {
+	int i;
+
 	mutex_lock(&dmxdev->mutex);
 	dmxdev->exit = 1;
+	for (i = 0; i < dmxdev->filternum; i++) {
+		if (dmxdev->filter[i].state == DMXDEV_STATE_FREE)
+			continue;
+#ifdef CONFIG_DVB_MMAP
+		if (dvb_vb2_is_streaming(&dmxdev->filter[i].vb2_ctx))
+			vb2_queue_error(&dmxdev->filter[i].vb2_ctx.vb_q);
+#endif
+		wake_up(&dmxdev->filter[i].buffer.queue);
+	}
+#ifdef CONFIG_DVB_MMAP
+	if (dmxdev->may_do_mmap && dvb_vb2_is_streaming(&dmxdev->dvr_vb2_ctx))
+		vb2_queue_error(&dmxdev->dvr_vb2_ctx.vb_q);
+#endif
+	wake_up(&dmxdev->dvr_buffer.queue);
 	mutex_unlock(&dmxdev->mutex);
 
 	if (dmxdev->dvbdev->users > 1) {

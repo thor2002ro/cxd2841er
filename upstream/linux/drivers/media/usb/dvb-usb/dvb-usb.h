@@ -501,6 +501,7 @@ extern int dvb_usb_device_init(struct usb_interface *,
 			       struct module *, struct dvb_usb_device **,
 			       short *adapter_nums);
 extern void dvb_usb_device_exit(struct usb_interface *);
+int dvb_usb_adapter_frontend_exit(struct dvb_usb_adapter *adap);
 
 /* the generic read/write method for device control */
 extern int __must_check

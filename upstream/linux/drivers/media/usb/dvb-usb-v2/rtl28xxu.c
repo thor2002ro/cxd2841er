@@ -55,6 +55,10 @@ static int rtl28xxu_ctrl_msg(struct dvb_usb_device *d, struct rtl28xxu_req *req)
 			req->index, dev->buf, req->size);
 	if (ret < 0)
 		goto err_mutex_unlock;
+	if (ret != req->size) {
+		ret = -EIO;
+		goto err_mutex_unlock;
+	}
 
 	/* read request, copy returned data to return buf */
 	if (requesttype == (USB_TYPE_VENDOR | USB_DIR_IN))

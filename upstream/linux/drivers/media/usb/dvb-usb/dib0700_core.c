@@ -196,6 +196,11 @@ static int dib0700_i2c_xfer_new(struct i2c_adapter *adap, struct i2c_msg *msg,
 			u16 index, value;
 			uint8_t i2c_dest;
 
+			if (msg[i].len > sizeof(st->buf)) {
+				result = -EIO;
+				goto unlock;
+			}
+
 			i2c_dest = (msg[i].addr << 1);
 			value = ((en_start << 7) | (en_stop << 6) |
 				 (msg[i].len & 0x3F)) << 8 | i2c_dest;
@@ -215,9 +220,7 @@ static int dib0700_i2c_xfer_new(struct i2c_adapter *adap, struct i2c_msg *msg,
 				goto unlock;
 			}
 
-			if (msg[i].len > sizeof(st->buf)) {
-				deb_info("buffer too small to fit %d bytes\n",
-					 msg[i].len);
+			if (result != msg[i].len) {
 				result = -EIO;
 				goto unlock;
 			}
@@ -265,7 +268,11 @@ static int dib0700_i2c_xfer_new(struct i2c_adapter *adap, struct i2c_msg *msg,
 			mutex_unlock(&d->usb_mutex);
 			if (result < 0) {
 				deb_info("i2c write error (status = %d)\n", result);
-				break;
+				goto unlock;
+			}
+			if (result != msg[i].len + 4) {
+				result = -EIO;
+				goto unlock;
 			}
 		}
 	}
@@ -913,19 +920,30 @@ static void dib0700_disconnect(struct usb_interface *intf)
 	struct dvb_usb_device *d = usb_get_intfdata(intf);
 	struct dib0700_state *st = d->priv;
 	struct i2c_client *client;
+	struct module *owner;
+	int i;
+
+	/* Xbox frontends embed state owned by the I2C demodulator. */
+	if (st->i2c_client_demod)
+		for (i = 0; i < d->num_adapters_initialized; i++)
+			dvb_usb_adapter_frontend_exit(&d->adapter[i]);
 
 	/* remove I2C client for tuner */
 	client = st->i2c_client_tuner;
 	if (client) {
-		module_put(client->dev.driver->owner);
+		owner = client->dev.driver->owner;
 		i2c_unregister_device(client);
+		st->i2c_client_tuner = NULL;
+		module_put(owner);
 	}
 
 	/* remove I2C client for demodulator */
 	client = st->i2c_client_demod;
 	if (client) {
-		module_put(client->dev.driver->owner);
+		owner = client->dev.driver->owner;
 		i2c_unregister_device(client);
+		st->i2c_client_demod = NULL;
+		module_put(owner);
 	}
 
 	dvb_usb_device_exit(intf);

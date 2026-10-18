@@ -3743,6 +3743,10 @@ static int xbox_one_attach(struct dvb_usb_adapter *adap)
 	struct mn88472_config mn88472_config = { };
 	struct tda18250_config tda18250_config;
 	struct i2c_board_info info;
+	struct dvb_frontend *fe;
+	struct module *owner;
+	bool demod_module = false;
+	int ret;
 
 	st->fw_use_new_i2c_api = 1;
 	st->disable_streaming_master_mode = 1;
@@ -3773,10 +3777,14 @@ static int xbox_one_attach(struct dvb_usb_adapter *adap)
 	info.platform_data = &mn88472_config;
 	request_module(info.type);
 	client_demod = i2c_new_client_device(&d->i2c_adap, &info);
+	if (IS_ERR(client_demod))
+		return PTR_ERR(client_demod);
+	ret = -ENODEV;
 	if (!i2c_client_has_driver(client_demod))
 		goto fail_demod_device;
 	if (!try_module_get(client_demod->dev.driver->owner))
-		goto fail_demod_module;
+		goto fail_demod_device;
+	demod_module = true;
 
 	st->i2c_client_demod = client_demod;
 
@@ -3801,22 +3809,31 @@ static int xbox_one_attach(struct dvb_usb_adapter *adap)
 
 	request_module(info.type);
 	client_tuner = i2c_new_client_device(&adap->dev->i2c_adap, &info);
+	if (IS_ERR(client_tuner)) {
+		ret = PTR_ERR(client_tuner);
+		goto fail_demod_device;
+	}
 	if (!i2c_client_has_driver(client_tuner))
 		goto fail_tuner_device;
 	if (!try_module_get(client_tuner->dev.driver->owner))
-		goto fail_tuner_module;
+		goto fail_tuner_device;
 
 	st->i2c_client_tuner = client_tuner;
 	return 0;
 
-fail_tuner_module:
-	i2c_unregister_device(client_tuner);
 fail_tuner_device:
-	module_put(client_demod->dev.driver->owner);
-fail_demod_module:
-	i2c_unregister_device(client_demod);
+	i2c_unregister_device(client_tuner);
 fail_demod_device:
-	return -ENODEV;
+	fe = adap->fe_adap[0].fe;
+	adap->fe_adap[0].fe = NULL;
+	st->i2c_client_demod = NULL;
+	owner = demod_module ? client_demod->dev.driver->owner : NULL;
+	i2c_unregister_device(client_demod);
+	if (fe)
+		dvb_frontend_detach(fe);
+	if (owner)
+		module_put(owner);
+	return ret;
 }
 
 

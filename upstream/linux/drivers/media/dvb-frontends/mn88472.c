@@ -766,7 +766,25 @@ err:
 	return ret;
 }
 
+static void mn88472_free(struct kref *ref)
+{
+	struct mn88472_dev *dev = container_of(ref, struct mn88472_dev, refcount);
+
+	kfree(dev);
+}
+
+static void mn88472_release(struct dvb_frontend *fe)
+{
+	struct mn88472_dev *dev = container_of(fe, struct mn88472_dev, fe);
+
+	kref_put(&dev->refcount, mn88472_free);
+#ifndef CONFIG_MEDIA_ATTACH
+	module_put(THIS_MODULE);
+#endif
+}
+
 static const struct dvb_frontend_ops mn88472_ops = {
+	.release = mn88472_release,
 	.delsys = {SYS_DVBT, SYS_DVBT2, SYS_DVBC_ANNEX_A},
 	.info = {
 		.name = "Panasonic MN88472",
@@ -843,6 +861,7 @@ static int mn88472_probe(struct i2c_client *client)
 	}
 
 	dev->i2c_write_max = pdata->i2c_wr_max ? pdata->i2c_wr_max : ~0;
+	kref_init(&dev->refcount);
 	dev->clk = pdata->xtal;
 	dev->ts_mode = pdata->ts_mode;
 	dev->ts_clk = pdata->ts_clock;
@@ -906,6 +925,10 @@ static int mn88472_probe(struct i2c_client *client)
 
 	/* Create dvb frontend */
 	memcpy(&dev->fe.ops, &mn88472_ops, sizeof(struct dvb_frontend_ops));
+	/* The frontend can remain open after its I2C device is removed. */
+	kref_get(&dev->refcount);
+	/* dvb_frontend_invoke_release() drops this reference with MEDIA_ATTACH. */
+	__module_get(THIS_MODULE);
 	dev->fe.demodulator_priv = client;
 	*pdata->fe = &dev->fe;
 	i2c_set_clientdata(client, dev);
@@ -954,7 +977,8 @@ static void mn88472_remove(struct i2c_client *client)
 
 	regmap_exit(dev->regmap[0]);
 
-	kfree(dev);
+	i2c_set_clientdata(client, NULL);
+	kref_put(&dev->refcount, mn88472_free);
 }
 
 static const struct i2c_device_id mn88472_id_table[] = {

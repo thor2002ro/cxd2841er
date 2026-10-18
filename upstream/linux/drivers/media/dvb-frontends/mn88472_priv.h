@@ -13,6 +13,7 @@
 #include "mn88472.h"
 #include <linux/firmware.h>
 #include <linux/regmap.h>
+#include <linux/kref.h>
 
 #define MN88472_FIRMWARE "dvb-demod-mn88472-02.fw"
 
@@ -25,6 +26,7 @@ struct mn88472_dev {
 	unsigned int active:1;
 	unsigned int ts_mode:1;
 	unsigned int ts_clk:1;
+	struct kref refcount;
 };
 
 #endif

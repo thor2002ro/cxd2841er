@@ -121,6 +121,7 @@ static int dvb_usbv2_remote_init(struct dvb_usb_device *d)
 	int ret;
 	struct rc_dev *dev;
 	dev_dbg(&d->udev->dev, "%s:\n", __func__);
+	INIT_DELAYED_WORK(&d->rc_query_work, dvb_usb_read_remote_control);
 
 	if (dvb_usbv2_disable_rc_polling || !d->props->get_rc_config)
 		return 0;
@@ -163,9 +164,6 @@ static int dvb_usbv2_remote_init(struct dvb_usb_device *d)
 
 	/* start polling if needed */
 	if (d->rc.query && !d->rc.bulk_mode) {
-		/* initialize a work queue for handling polling */
-		INIT_DELAYED_WORK(&d->rc_query_work,
-				dvb_usb_read_remote_control);
 		dev_info(&d->udev->dev,
 				"%s: schedule remote query interval to %d msecs\n",
 				KBUILD_MODNAME, d->rc.interval);
@@ -243,7 +241,7 @@ static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)
 {
 	struct dvb_usb_adapter *adap = dvbdmxfeed->demux->priv;
 	struct dvb_usb_device *d = adap_to_d(adap);
-	int ret = 0;
+	int ret = 0, cleanup_ret;
 	struct usb_data_stream_properties stream_props;
 	dev_dbg(&d->udev->dev,
 			"%s: adap=%d active_fe=%d feed_type=%d setting pid [%s]: %04x (%04d) at index %d\n",
@@ -270,10 +268,12 @@ static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)
 				sizeof(struct usb_data_stream_properties));
 		ret = d->props->get_stream_config(adap->fe[adap->active_fe],
 				&adap->ts_type, &stream_props);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: get_stream_config() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_stream;
+		}
 	} else {
 		stream_props = adap->props->stream;
 	}
@@ -292,24 +292,30 @@ static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)
 	}
 
 	/* submit USB streaming packets */
-	usb_urb_submitv2(&adap->stream, &stream_props);
+	ret = usb_urb_submitv2(&adap->stream, &stream_props);
+	if (ret)
+		goto err_stream;
 
 	/* enable HW PID filter */
 	if (adap->pid_filtering && adap->props->pid_filter_ctrl) {
 		ret = adap->props->pid_filter_ctrl(adap, 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: pid_filter_ctrl() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_filter;
+		}
 	}
 
 	/* ask device to start streaming */
 	if (d->props->streaming_ctrl) {
 		ret = d->props->streaming_ctrl(adap->fe[adap->active_fe], 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: streaming_ctrl() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_enable;
+		}
 	}
 skip_feed_start:
 
@@ -317,11 +323,42 @@ skip_feed_start:
 	if (adap->pid_filtering && adap->props->pid_filter) {
 		ret = adap->props->pid_filter(adap, dvbdmxfeed->index,
 				dvbdmxfeed->pid, 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev, "%s: pid_filter() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			cleanup_ret = adap->props->pid_filter(adap,
+					dvbdmxfeed->index, dvbdmxfeed->pid, 0);
+			if (cleanup_ret)
+				dev_err(&d->udev->dev, "PID cleanup failed=%d\n",
+					cleanup_ret);
+			if (adap->feed_count > 1)
+				goto err_count;
+			goto err_enable;
+		}
 	}
 
+	return 0;
+
+err_enable:
+	if (d->props->streaming_ctrl) {
+		cleanup_ret = d->props->streaming_ctrl(adap->fe[adap->active_fe], 0);
+		if (cleanup_ret)
+			dev_err(&d->udev->dev, "Stream cleanup failed=%d\n", cleanup_ret);
+	}
+err_filter:
+	if (adap->pid_filtering && adap->props->pid_filter_ctrl) {
+		cleanup_ret = adap->props->pid_filter_ctrl(adap, 0);
+		if (cleanup_ret)
+			dev_err(&d->udev->dev, "Filter cleanup failed=%d\n", cleanup_ret);
+	}
+err_stream:
+	usb_urb_killv2(&adap->stream);
+	clear_bit(ADAP_STREAMING, &adap->state_bits);
+	/* Publish the cleared bit before waking frontend sleep. */
+	smp_mb__after_atomic();
+	wake_up_bit(&adap->state_bits, ADAP_STREAMING);
+err_count:
+	adap->feed_count--;
 	if (ret)
 		dev_dbg(&d->udev->dev, "%s: failed=%d\n", __func__, ret);
 	return ret;
