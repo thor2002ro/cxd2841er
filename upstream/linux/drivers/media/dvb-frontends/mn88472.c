@@ -268,7 +268,8 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		GUARD_INTERVAL_1_128, GUARD_INTERVAL_19_128,
 		GUARD_INTERVAL_19_256, GUARD_INTERVAL_AUTO,
 	};
-	unsigned int utmp;
+	unsigned int utmp, cable_qam;
+	u64 symbol_rate;
 	u8 buf[3];
 	int ret;
 
@@ -329,8 +330,21 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		ret = regmap_read(dev->regmap[1], 0x83, &utmp);
 		if (ret)
 			goto err;
+		cable_qam = utmp & 0x07;
+		if (dev->clk == 20500000) {
+			ret = regmap_bulk_read(dev->regmap[1], 0x86, buf, 3);
+			if (ret)
+				goto err;
+			utmp = buf[0] << 16 | buf[1] << 8 | buf[2];
+			if (utmp) {
+				/* This PLL setup uses a 20.5 MHz ADC clock. */
+				symbol_rate = DIV_ROUND_CLOSEST_ULL(20500000ULL << 18, utmp);
+				if (symbol_rate <= U32_MAX)
+					c->symbol_rate = symbol_rate;
+			}
+		}
 
-		c->modulation = cable_modulation[utmp & 0x07];
+		c->modulation = cable_modulation[cable_qam];
 		return 0;
 	}
 	if (c->delivery_system != SYS_DVBT)
