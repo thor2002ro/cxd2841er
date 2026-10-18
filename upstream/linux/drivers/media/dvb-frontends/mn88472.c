@@ -335,6 +335,7 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 	u8 buf[3], delivery_system_val, bandwidth_val, *bandwidth_vals_ptr;
 	u8 reg_bank0_b4_val, reg_bank0_cd_val, reg_bank0_d4_val;
 	u8 reg_bank0_d6_val;
+	u8 reg_bank0_00_val, reg_bank0_01_val;
 
 	dev_dbg(&client->dev,
 		"delivery_system=%u modulation=%u frequency=%u bandwidth_hz=%u symbol_rate=%u inversion=%d stream_id=%d\n",
@@ -481,13 +482,24 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 
 	switch (c->delivery_system) {
 	case SYS_DVBT:
+		if ((c->transmission_mode == TRANSMISSION_MODE_2K ||
+		     c->transmission_mode == TRANSMISSION_MODE_8K) &&
+		    (unsigned int)c->guard_interval <= GUARD_INTERVAL_1_4) {
+			reg_bank0_00_val = 0xf0 |
+				(c->transmission_mode == TRANSMISSION_MODE_8K ?
+				 0x08 : 0x00) | c->guard_interval;
+			reg_bank0_01_val = 0x00;
+		} else {
+			reg_bank0_00_val = 0xba;
+			reg_bank0_01_val = 0x13;
+		}
 		ret = regmap_write(dev->regmap[0], 0x07, 0x26);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[0], 0x00, 0xba);
+		ret = regmap_write(dev->regmap[0], 0x00, reg_bank0_00_val);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[0], 0x01, 0x13);
+		ret = regmap_write(dev->regmap[0], 0x01, reg_bank0_01_val);
 		if (ret)
 			goto err;
 		break;
