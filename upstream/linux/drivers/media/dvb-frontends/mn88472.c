@@ -59,6 +59,18 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 			*status = 0;
 		break;
 	case SYS_DVBC_ANNEX_A:
+		*status = 0;
+		/* QAM errors or missing VQLOCK invalidate the acquisition stage. */
+		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
+		if (ret)
+			goto err;
+		if (utmp & 0x40)
+			break;
+		ret = regmap_read(dev->regmap[1], 0x89, &utmp);
+		if (ret)
+			goto err;
+		if (!(utmp & 0x01))
+			break;
 		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
 		if (ret)
 			goto err;
