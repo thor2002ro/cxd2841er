@@ -228,6 +228,10 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	static const enum fe_modulation modulation[] = {
 		QPSK, QAM_16, QAM_64, QAM_AUTO,
 	};
+	static const enum fe_modulation cable_modulation[] = {
+		QAM_64, QAM_256, QAM_128, QAM_32, QAM_16,
+		QAM_AUTO, QAM_AUTO, QAM_AUTO,
+	};
 	static const enum fe_hierarchy hierarchy[] = {
 		HIERARCHY_NONE, HIERARCHY_1, HIERARCHY_2, HIERARCHY_4,
 		HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO, HIERARCHY_AUTO,
@@ -248,7 +252,33 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	u8 buf[3];
 	int ret;
 
-	if (!dev->active || c->delivery_system != SYS_DVBT)
+	if (!dev->active)
+		return 0;
+
+	if (c->delivery_system == SYS_DVBC_ANNEX_A) {
+		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
+		if (ret)
+			goto err;
+		if (utmp & 0x40)
+			return 0;
+		ret = regmap_read(dev->regmap[1], 0x89, &utmp);
+		if (ret)
+			goto err;
+		if (!(utmp & 0x01))
+			return 0;
+		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
+		if (ret)
+			goto err;
+		if ((utmp & 0x0f) < 8)
+			return 0;
+		ret = regmap_read(dev->regmap[1], 0x83, &utmp);
+		if (ret)
+			goto err;
+
+		c->modulation = cable_modulation[utmp & 0x07];
+		return 0;
+	}
+	if (c->delivery_system != SYS_DVBT)
 		return 0;
 
 	ret = regmap_read(dev->regmap[0], 0x7f, &utmp);
