@@ -1097,6 +1097,7 @@ static int r820t_set_tv_standard(struct r820t_priv *priv,
 		need_calibration = false;
 
 	if (need_calibration) {
+		priv->type = -1;
 		tuner_dbg("calibrating the tuner\n");
 		for (i = 0; i < 2; i++) {
 			/* Set filt_cap */
@@ -1845,7 +1846,9 @@ static int r820t_iq(struct r820t_priv *priv, struct r820t_sect_type *iq_pont)
 	u8 x_direction = 0;  /* 1:x, 0:y */
 	u8 dir_reg, other_reg;
 
-	r820t_vga_adjust(priv);
+	rc = r820t_vga_adjust(priv);
+	if (rc < 0)
+		return rc;
 
 	rc = r820t_imr_cross(priv, compare_iq, &x_direction);
 	if (rc < 0)
@@ -1891,6 +1894,8 @@ static int r820t_iq(struct r820t_priv *priv, struct r820t_sect_type *iq_pont)
 
 	/* section-9 check */
 	rc = r820t_section(priv, compare_iq);
+	if (rc < 0)
+		return rc;
 
 	*iq_pont = compare_iq[0];
 
@@ -1908,7 +1913,9 @@ static int r820t_f_imr(struct r820t_priv *priv, struct r820t_sect_type *iq_pont)
 {
 	int rc;
 
-	r820t_vga_adjust(priv);
+	rc = r820t_vga_adjust(priv);
+	if (rc < 0)
+		return rc;
 
 	/*
 	 * search surrounding points from previous point
@@ -2019,10 +2026,10 @@ static int r820t_imr(struct r820t_priv *priv, unsigned imr_mem, bool im_flag)
 
 	rc = r820t_set_pll(priv, V4L2_TUNER_DIGITAL_TV,
 			   (ring_freq - 5300) * 1000);
-	if (!priv->has_lock)
-		rc = -EINVAL;
 	if (rc < 0)
 		return rc;
+	if (!priv->has_lock)
+		return -ETIMEDOUT;
 
 	if (im_flag) {
 		rc = r820t_iq(priv, &imr_point);
@@ -2479,7 +2486,7 @@ err_no_gate:
 }
 EXPORT_SYMBOL_GPL(r820t_attach);
 
-MODULE_VERSION("1.0.2");
+MODULE_VERSION("1.0.3");
 MODULE_DESCRIPTION("Rafael Micro r820t silicon tuner driver");
 MODULE_AUTHOR("Mauro Carvalho Chehab");
 MODULE_LICENSE("GPL v2");

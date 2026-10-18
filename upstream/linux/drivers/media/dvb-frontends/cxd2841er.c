@@ -29,7 +29,7 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.2"
+#define CXD2841ER_VERSION "1.1.3"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
@@ -205,6 +205,8 @@ static const struct cxd2841er_cnr_data s2_cn_data[] = {
 static int cxd2841er_freeze_regs(struct cxd2841er_priv *priv);
 static int cxd2841er_unfreeze_regs(struct cxd2841er_priv *priv);
 static void cxd2841er_init_stats(struct dvb_frontend *fe);
+static int cxd2841er_init_s(struct dvb_frontend *fe);
+static int cxd2841er_init_tc(struct dvb_frontend *fe);
 
 static void cxd2841er_i2c_debug(struct cxd2841er_priv *priv,
 				u8 addr, u8 reg, u8 write,
@@ -1654,19 +1656,19 @@ static int cxd2841er_get_carrier_offset_i(struct cxd2841er_priv *priv,
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x4c, data, sizeof(data));
 	if (ret)
 		return ret;
-	*offset = -1 * sign_extend32(
+	*offset = sign_extend32(
 		((u32)(data[0] & 0x1F) << 24) | ((u32)data[1] << 16) |
-		((u32)data[2] << 8) | (u32)data[3], 29);
+		((u32)data[2] << 8) | (u32)data[3], 28);
 
 	switch (bandwidth) {
 	case 6000000:
-		*offset = -1 * ((*offset) * 8/264);
+		*offset = div_s64((s64)*offset * 8, 264);
 		break;
 	case 7000000:
-		*offset = -1 * ((*offset) * 8/231);
+		*offset = div_s64((s64)*offset * 8, 231);
 		break;
 	case 8000000:
-		*offset = -1 * ((*offset) * 8/198);
+		*offset = div_s64((s64)*offset * 8, 198);
 		break;
 	default:
 		dev_dbg(&priv->i2c->dev, "%s(): invalid bandwidth %d\n",
@@ -2042,7 +2044,7 @@ static int cxd2841er_mon_read_ber_s2(struct cxd2841er_priv *priv,
 static int cxd2841er_read_ber_t2(struct cxd2841er_priv *priv,
 				 u32 *bit_error, u64 *bit_count)
 {
-	int ret;
+	int ret, unfreeze_ret;
 	u8 data[4];
 	u32 period_exp, n_ldpc;
 
@@ -2051,16 +2053,20 @@ static int cxd2841er_read_ber_t2(struct cxd2841er_priv *priv,
 			"%s(): invalid state %d\n", __func__, priv->state);
 		return -EINVAL;
 	}
+	ret = cxd2841er_freeze_regs(priv);
+	if (ret)
+		return ret;
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x20);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x39, data, sizeof(data));
 	if (ret)
-		return ret;
+		goto unfreeze;
 	if (!(data[0] & 0x10)) {
 		dev_dbg(&priv->i2c->dev,
 			"%s(): no valid BER data\n", __func__);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unfreeze;
 	}
 	*bit_error = ((u32)(data[0] & 0x0f) << 24) |
 		     ((u32)data[1] << 16) |
@@ -2068,29 +2074,36 @@ static int cxd2841er_read_ber_t2(struct cxd2841er_priv *priv,
 		     (u32)data[3];
 	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x6f, data);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	period_exp = data[0] & 0x0f;
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x22);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x5e, data);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	n_ldpc = ((data[0] & 0x03) == 0 ? 16200 : 64800);
 	if (*bit_error > ((1U << period_exp) * n_ldpc)) {
 		dev_dbg(&priv->i2c->dev,
 			"%s(): invalid BER value\n", __func__);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unfreeze;
 	}
 
 	*bit_count = (1ULL << period_exp) * n_ldpc;
-	return 0;
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
+	if (unfreeze_ret)
+		dev_warn_ratelimited(&priv->i2c->dev,
+			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
+			__func__, unfreeze_ret, ret);
+	return ret ? ret : unfreeze_ret;
 }
 
 static int cxd2841er_read_ber_t(struct cxd2841er_priv *priv,
 				u32 *bit_error, u64 *bit_count)
 {
-	int ret;
+	int ret, unfreeze_ret;
 	u8 data[2];
 	u32 period;
 
@@ -2099,30 +2112,42 @@ static int cxd2841er_read_ber_t(struct cxd2841er_priv *priv,
 			"%s(): invalid state %d\n", __func__, priv->state);
 		return -EINVAL;
 	}
+	ret = cxd2841er_freeze_regs(priv);
+	if (ret)
+		return ret;
 	ret = cxd2841er_write_reg(priv, I2C_SLVT, 0x00, 0x10);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x39, data);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	if (!(data[0] & 0x01)) {
 		dev_dbg(&priv->i2c->dev,
 			"%s(): no valid BER data\n", __func__);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unfreeze;
 	}
 	ret = cxd2841er_read_regs(priv, I2C_SLVT, 0x22, data, sizeof(data));
 	if (ret)
-		return ret;
+		goto unfreeze;
 	*bit_error = ((u32)data[0] << 8) | (u32)data[1];
 	ret = cxd2841er_read_reg(priv, I2C_SLVT, 0x6f, data);
 	if (ret)
-		return ret;
+		goto unfreeze;
 	period = ((data[0] & 0x07) == 0) ? 256 : (4096 << (data[0] & 0x07));
 
-	if (*bit_error > period)
-		return -EINVAL;
+	if (*bit_error > period) {
+		ret = -EINVAL;
+		goto unfreeze;
+	}
 	*bit_count = period;
-	return 0;
+unfreeze:
+	unfreeze_ret = cxd2841er_unfreeze_regs(priv);
+	if (unfreeze_ret)
+		dev_warn_ratelimited(&priv->i2c->dev,
+			"%s(): snapshot release failed: ret=%d, read ret=%d\n",
+			__func__, unfreeze_ret, ret);
+	return ret ? ret : unfreeze_ret;
 }
 
 static int cxd2841er_freeze_regs(struct cxd2841er_priv *priv)
@@ -2531,7 +2556,8 @@ static void cxd2841er_read_ber(struct dvb_frontend *fe)
 	struct dtv_fe_stats *count = &p->post_bit_count;
 	int ret;
 
-	if (p->delivery_system == SYS_DVBT || p->delivery_system == SYS_DVBT2) {
+	if (p->delivery_system == SYS_DVBT || p->delivery_system == SYS_DVBT2 ||
+	    p->delivery_system == SYS_DVBS2) {
 		error = &p->pre_bit_error;
 		count = &p->pre_bit_count;
 	}
@@ -4518,7 +4544,6 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 	u32 symbol_rate = p->symbol_rate/1000;
 
-	priv->tune_error = 0;
 	cxd2841er_init_stats(fe);
 
 	dev_dbg(&priv->i2c->dev, "%s(): %s frequency=%d symbol_rate=%d xtal=%d\n",
@@ -4531,6 +4556,13 @@ static int cxd2841er_set_frontend_s(struct dvb_frontend *fe)
 		ret = -EINVAL;
 		goto done;
 	}
+	/* A failed transition can leave hardware partly asleep despite ACTIVE. */
+	if (priv->tune_error || priv->state == STATE_SHUTDOWN) {
+		ret = cxd2841er_init_s(fe);
+		if (ret)
+			goto done;
+	}
+	priv->tune_error = 0;
 
 	if (priv->flags & CXD2841ER_EARLY_TUNE) {
 		ret = cxd2841er_tuner_set(fe);
@@ -4608,7 +4640,6 @@ static int cxd2841er_set_frontend_tc(struct dvb_frontend *fe)
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 
-	priv->tune_error = 0;
 	cxd2841er_init_stats(fe);
 
 	dev_dbg(&priv->i2c->dev, "%s() delivery_system=%d bandwidth_hz=%d\n",
@@ -4620,6 +4651,13 @@ static int cxd2841er_set_frontend_tc(struct dvb_frontend *fe)
 		ret = -EINVAL;
 		goto done;
 	}
+	/* Reinitialize before the active-retune fast path after any failed setup. */
+	if (priv->tune_error || priv->state == STATE_SHUTDOWN) {
+		ret = cxd2841er_init_tc(fe);
+		if (ret)
+			goto done;
+	}
+	priv->tune_error = 0;
 
 	if (priv->flags & CXD2841ER_EARLY_TUNE) {
 		ret = cxd2841er_tuner_set(fe);
@@ -4885,9 +4923,15 @@ static int cxd2841er_sleep_s(struct dvb_frontend *fe)
 	if (priv->state == STATE_ACTIVE_S) {
 		ret = cxd2841er_active_s_to_sleep_s(priv);
 		if (ret)
-			return ret;
+			goto error;
 	}
-	return cxd2841er_sleep_s_to_shutdown(priv);
+	ret = cxd2841er_sleep_s_to_shutdown(priv);
+	if (ret)
+		goto error;
+	return 0;
+error:
+	priv->tune_error = ret;
+	return ret;
 }
 
 static int cxd2841er_sleep_tc(struct dvb_frontend *fe)
@@ -4903,22 +4947,22 @@ static int cxd2841er_sleep_tc(struct dvb_frontend *fe)
 		case SYS_DVBT:
 			ret = cxd2841er_active_t_to_sleep_tc(priv);
 			if (ret)
-				return ret;
+				goto error;
 			break;
 		case SYS_DVBT2:
 			ret = cxd2841er_active_t2_to_sleep_tc(priv);
 			if (ret)
-				return ret;
+				goto error;
 			break;
 		case SYS_ISDBT:
 			ret = cxd2841er_active_i_to_sleep_tc(priv);
 			if (ret)
-				return ret;
+				goto error;
 			break;
 		case SYS_DVBC_ANNEX_A:
 			ret = cxd2841er_active_c_to_sleep_tc(priv);
 			if (ret)
-				return ret;
+				goto error;
 			break;
 		default:
 			dev_warn(&priv->i2c->dev,
@@ -4929,9 +4973,13 @@ static int cxd2841er_sleep_tc(struct dvb_frontend *fe)
 	if (priv->state != STATE_SLEEP_TC) {
 		dev_err(&priv->i2c->dev, "%s(): invalid state %d\n",
 			__func__, priv->state);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto error;
 	}
 	return 0;
+error:
+	priv->tune_error = ret;
+	return ret;
 }
 
 static int cxd2841er_shutdown_tc(struct dvb_frontend *fe)
@@ -4946,7 +4994,10 @@ static int cxd2841er_shutdown_tc(struct dvb_frontend *fe)
 	ret = cxd2841er_sleep_tc(fe);
 	if (ret)
 		return ret;
-	return cxd2841er_sleep_tc_to_shutdown(priv);
+	ret = cxd2841er_sleep_tc_to_shutdown(priv);
+	if (ret)
+		priv->tune_error = ret;
+	return ret;
 }
 
 static int cxd2841er_send_burst(struct dvb_frontend *fe,
@@ -5108,12 +5159,12 @@ static void cxd2841er_init_stats(struct dvb_frontend *fe)
 	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	bool pre = p->delivery_system == SYS_DVBT ||
-		p->delivery_system == SYS_DVBT2;
+		p->delivery_system == SYS_DVBT2 || p->delivery_system == SYS_DVBS2;
 	bool cable = p->delivery_system == SYS_DVBC_ANNEX_A ||
 		p->delivery_system == SYS_DVBC_ANNEX_B ||
 		p->delivery_system == SYS_DVBC_ANNEX_C;
 	bool post = cable || p->delivery_system == SYS_ISDBT ||
-		p->delivery_system == SYS_DVBS || p->delivery_system == SYS_DVBS2;
+		p->delivery_system == SYS_DVBS;
 
 	priv->stats_time = 0;
 	memset(&p->strength, 0, sizeof(p->strength));
