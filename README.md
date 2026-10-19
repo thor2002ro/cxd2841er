@@ -13,7 +13,7 @@ All ten custom modules expose a version through their module metadata:
 | --- | --- |
 | `cxd2841er` | 1.1.11 |
 | `r820t` | 1.0.3 |
-| `mn88472` | 1.0.0 |
+| `mn88472` | 1.0.1 |
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
@@ -72,16 +72,18 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 - Releases shared tuner state when attachment fails and reports AGC as an
   uncalibrated relative strength rather than an invented dBm value.
 
-### `mn88472` 1.0.0
+### `mn88472` 1.0.1
 
 - Writes firmware through the fixed program-data port, validates configuration
   and transfer limits, identifies parity failures, and clears active/statistics
   state before power or tune changes.
 - Rejects false DVB-T, DVB-T2 and DVB-C locks using the demodulator error flags,
-  QAM validity and VQLOCK instead of trusting acquisition stage alone.
+  QAM validity and VQLOCK, and accepts only DVB-C acquisition stages 8 or 9.
 - Programs cable bandwidth and QAM, DVB-T mode and guard interval, and DVB-T2
   PLP selection without leaking settings from a previous tune. Explicit PLP
   IDs use ID lookup; the automatic fallback uses index lookup.
+- Waits 10 ms after resetting the demodulator state machine before returning
+  from a successful tune, matching the vendor sequence.
 - Reports detected DVB-T modulation, hierarchy, code rates, FFT and guard;
   DVB-T2 modulation, code rate, FFT and guard; and DVB-C modulation and symbol
   rate only after complete valid reads.

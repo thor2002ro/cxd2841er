@@ -5,6 +5,7 @@
  * Copyright (C) 2013 Antti Palosaari <crope@iki.fi>
  */
 
+#include <linux/delay.h>
 #include <linux/limits.h>
 #include <linux/module.h>
 
@@ -92,7 +93,8 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
 		if (ret)
 			goto err;
-		if ((utmp & 0x0f) >= 0x08)
+		utmp &= 0x0f;
+		if (utmp == 0x08 || utmp == 0x09)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
 		else
@@ -342,7 +344,8 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
 		if (ret)
 			goto err;
-		if ((utmp & 0x0f) < 8)
+		utmp &= 0x0f;
+		if (utmp != 0x08 && utmp != 0x09)
 			return 0;
 		/* QAM detection is optional, but symbol-rate readback stays available. */
 		if (stats_mask & MN88472_STATS_QAM) {
@@ -627,10 +630,11 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		break;
 	}
 
-	/* Reset FSM */
+	/* Reset the FSM and allow the demodulator to settle before polling it. */
 	ret = regmap_write(dev->regmap[2], 0xf8, 0x9f);
 	if (ret)
 		goto err;
+	usleep_range(10000, 11000);
 
 	return 0;
 err:
@@ -1025,7 +1029,7 @@ static struct i2c_driver mn88472_driver = {
 
 module_i2c_driver(mn88472_driver);
 
-MODULE_VERSION("1.0.0");
+MODULE_VERSION("1.0.1");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("Panasonic MN88472 DVB-T/T2/C demodulator driver");
 MODULE_LICENSE("GPL");
