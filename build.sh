@@ -13,7 +13,7 @@ sudo_cmd=
 [ "$(id -u)" -eq 0 ] || [ -n "${INSTALL_MOD_PATH:-}" ] || sudo_cmd=sudo
 case "${1:-install}" in
     install)
-        make
+        make -j"$(nproc)"
         # Validate the entire set before changing any installed file.
         for module in $modules; do
             file="upstream/linux/$module.ko"
