@@ -17,9 +17,9 @@ All ten custom modules expose a version through their module metadata:
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
-| `dvb-usb` | 1.0.1 |
+| `dvb-usb` | 1.0.5 |
 | `dvb_usb_v2` | 2.0.1 |
-| `dvb-usb-dib0700` | 1.0.1 |
+| `dvb-usb-dib0700` | 1.0.3 |
 | `dvb-usb-rtl28xxu` | 1.0.0 |
 
 `CXD2841ER_VERSION` in `cxd2841er.c` is used by both the module metadata and
@@ -109,11 +109,22 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 - Marks active mmap queues as failed and lets blocking `DMX_DQBUF` release the
   mutex needed by device removal.
 
-### `dvb-usb` 1.0.1
+### `dvb-usb` 1.0.5
 
 - Rolls back PID filters, the PID parser, streaming, URBs and feed counts when
   the first legacy feed fails to start. Final-feed cleanup still completes if
   stopping the device reports an error.
+- Drops data from failed bulk transfers and queues immediate recovery,
+  including overflow and protocol errors. It pauses resubmission, drains URBs and
+  checks the parent port: connected/enabled clears the endpoint and restarts
+  receives; connected/disabled queues a USB-core device reset; disconnected
+  stops recovery. Only failed repairs wait 500 ms before retrying, without
+  restarting a stopped feed. A device reset can rebind the tuner and require
+  TVHeadend to reopen it.
+- Reports completion length, buffer capacity and endpoint in recovery warnings;
+  resubmission failures are identified separately.
+- Rebuild and deploy together with `dvb-usb-dib0700` 1.0.3; the shared
+  stream/device structures changed.
 - Exposes early frontend cleanup for bridge drivers, clears detached frontend
   pointers, and preserves the original error while reporting rollback errors.
 
@@ -124,7 +135,7 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 - Rolls back submitted URBs, filters, streaming state and feed counts when any
   stream-start stage fails, and wakes waiters after clearing the streaming bit.
 
-### `dvb-usb-dib0700` 1.0.1
+### `dvb-usb-dib0700` 1.0.3
 
 - Rejects short USB control and I2C transfers, guards transfer lengths, returns
   clock/version errors, and cleans up a probe whose version read fails.
@@ -132,6 +143,8 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
   partial demodulator or tuner attachment.
 - Detaches Xbox frontends before unregistering their tuner and demodulator I2C
   clients, retaining module references until client removal is complete.
+- Rounds bulk receive buffers upward to complete 512-byte USB packets. This
+  prevents a final packet from overflowing the old 39,480-byte allocation.
 
 ### `dvb-usb-rtl28xxu` 1.0.0
 

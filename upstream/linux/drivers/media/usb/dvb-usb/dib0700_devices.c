@@ -4059,7 +4059,8 @@ MODULE_DEVICE_TABLE(usb, dib0700_usb_id_table);
 		.endpoint = ep, \
 		.u = { \
 			.bulk = { \
-				.buffersize = 39480, \
+				/* Keep room for a complete 512-byte USB packet. */ \
+				.buffersize = 39936, \
 			} \
 		} \
 	}

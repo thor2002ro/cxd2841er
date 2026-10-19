@@ -583,7 +583,7 @@ int dib0700_download_firmware(struct usb_device *udev, const struct firmware *fw
 		for (adap_num = 0; adap_num < dib0700_devices[i].num_adapters;
 				adap_num++) {
 			if (fw_version >= 0x10201) {
-				dib0700_devices[i].adapter[adap_num].fe[0].stream.u.bulk.buffersize = 188*nb_packet_buffer_size;
+				dib0700_devices[i].adapter[adap_num].fe[0].stream.u.bulk.buffersize = roundup(188*nb_packet_buffer_size, 512);
 			} else {
 				/* for fw version older than 1.20.1,
 				 * the buffersize has to be n times 512 */
@@ -979,5 +979,5 @@ module_usb_driver(dib0700_driver);
 MODULE_FIRMWARE("dvb-usb-dib0700-1.20.fw");
 MODULE_AUTHOR("Patrick Boettcher <patrick.boettcher@posteo.de>");
 MODULE_DESCRIPTION("Driver for devices based on DiBcom DiB0700 - USB bridge");
-MODULE_VERSION("1.0.1");
+MODULE_VERSION("1.0.3");
 MODULE_LICENSE("GPL");

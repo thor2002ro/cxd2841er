@@ -10,13 +10,47 @@
  * Hybrid USB devices (analog and DVB).
  */
 #include "dvb-usb-common.h"
+#include <linux/usb/ch11.h>
+
+/* Back off only when repair fails; the first attempt has no timer delay. */
+#define USB_URB_RECOVERY_RETRY_MS 500
+
+static void usb_urb_recover(struct work_struct *work);
+
+static void usb_urb_queue_recovery(struct usb_data_stream *stream, int status,
+				   const struct urb *urb, bool resubmit)
+{
+	if (!READ_ONCE(stream->running))
+		return;
+
+	if (status == -ENODEV || status == -ESHUTDOWN ||
+	    status == -ENOENT || status == -ECONNRESET || status == -EPERM)
+		return;
+
+	/* Keep completions from refilling a pipe that is waiting for repair. */
+	WRITE_ONCE(stream->recovering, true);
+	if (schedule_delayed_work(&stream->recovery_work, 0)) {
+		if (resubmit)
+			dev_warn_ratelimited(&stream->udev->dev,
+				"bulk stream resubmit error %d after %d/%d-byte completion, endpoint 0x%02x, scheduling recovery\n",
+				status, urb->actual_length,
+				urb->transfer_buffer_length,
+				stream->props.endpoint);
+		else
+			dev_warn_ratelimited(&stream->udev->dev,
+				"bulk stream error %d, %d/%d bytes, endpoint 0x%02x, scheduling recovery\n",
+				status, urb->actual_length,
+				urb->transfer_buffer_length,
+				stream->props.endpoint);
+	}
+}
 
 /* URB stuff for streaming */
 static void usb_urb_complete(struct urb *urb)
 {
 	struct usb_data_stream *stream = urb->context;
 	int ptype = usb_pipetype(urb->pipe);
-	int i;
+	int i, ret;
 	u8 *b;
 
 	deb_uxfer("'%s' urb completed. status: %d, length: %d/%d, pack_num: %d, errors: %d\n",
@@ -31,9 +65,16 @@ static void usb_urb_complete(struct urb *urb)
 		case -ECONNRESET:   /* kill */
 		case -ENOENT:
 		case -ESHUTDOWN:
+		case -ENODEV:
 			return;
 		default:        /* error */
 			deb_ts("urb completion error %d.\n", urb->status);
+			if (ptype == PIPE_BULK) {
+				/* HCW95 also repairs transfer faults, not just stalls. */
+				usb_urb_queue_recovery(stream, urb->status,
+						       urb, false);
+				goto resubmit;
+			}
 			break;
 	}
 
@@ -60,12 +101,18 @@ static void usb_urb_complete(struct urb *urb)
 			err("unknown endpoint type in completion handler.");
 			return;
 	}
-	usb_submit_urb(urb,GFP_ATOMIC);
+resubmit:
+	if (!READ_ONCE(stream->running) || READ_ONCE(stream->recovering))
+		return;
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret && ptype == PIPE_BULK)
+		usb_urb_queue_recovery(stream, ret, urb, true);
 }
 
-int usb_urb_kill(struct usb_data_stream *stream)
+static void usb_urb_kill_locked(struct usb_data_stream *stream)
 {
 	int i;
+
 	for (i = 0; i < stream->urbs_submitted; i++) {
 		deb_ts("killing URB no. %d.\n",i);
 
@@ -73,22 +120,128 @@ int usb_urb_kill(struct usb_data_stream *stream)
 		usb_kill_urb(stream->urb_list[i]);
 	}
 	stream->urbs_submitted = 0;
-	return 0;
 }
 
-int usb_urb_submit(struct usb_data_stream *stream)
+static int usb_urb_submit_locked(struct usb_data_stream *stream,
+				 gfp_t mem_flags)
 {
 	int i,ret;
+
 	for (i = 0; i < stream->urbs_initialized; i++) {
 		deb_ts("submitting URB no. %d\n",i);
-		if ((ret = usb_submit_urb(stream->urb_list[i],GFP_ATOMIC))) {
-			err("could not submit URB no. %d - get them all back",i);
-			usb_urb_kill(stream);
+		ret = usb_submit_urb(stream->urb_list[i], mem_flags);
+		if (ret) {
+			err("could not submit URB no. %d: %d", i, ret);
+			usb_urb_kill_locked(stream);
 			return ret;
 		}
 		stream->urbs_submitted++;
 	}
 	return 0;
+}
+
+static void usb_urb_recover(struct work_struct *work)
+{
+	struct usb_data_stream *stream = container_of(to_delayed_work(work),
+			struct usb_data_stream, recovery_work);
+	struct usb_port_status port_status;
+	u16 status;
+	int ret = 0;
+
+	mutex_lock(&stream->recovery_lock);
+	if (!READ_ONCE(stream->running) || !READ_ONCE(stream->recovering))
+		goto unlock;
+
+	/* Restart the complete set so urbs_submitted remains an exact prefix. */
+	usb_urb_kill_locked(stream);
+	if (stream->udev->state == USB_STATE_NOTATTACHED ||
+	    !stream->udev->parent) {
+		ret = -ENODEV;
+		goto failed;
+	}
+
+	/* Standard hub port status is four bytes, without the USB 3 extension. */
+	ret = usb_control_msg_recv(stream->udev->parent, 0, USB_REQ_GET_STATUS,
+				  USB_DIR_IN | USB_RT_PORT, 0,
+				  stream->udev->portnum, &port_status, 4,
+				  USB_CTRL_GET_TIMEOUT, GFP_KERNEL);
+	if (ret)
+		goto failed;
+	if (!READ_ONCE(stream->running))
+		goto unlock;
+	status = le16_to_cpu(port_status.wPortStatus);
+	if (!(status & USB_PORT_STAT_CONNECTION)) {
+		ret = -ENODEV;
+		goto failed;
+	}
+	if (!(status & USB_PORT_STAT_ENABLE)) {
+		/* USB core must own a port reset: it can unbind this driver. */
+		WRITE_ONCE(stream->running, false);
+		dev_warn_ratelimited(&stream->udev->dev,
+				     "bulk stream port disabled, scheduling device reset\n");
+		usb_queue_reset_device(stream->intf);
+		goto unlock;
+	}
+
+	ret = usb_clear_halt(stream->udev,
+			     usb_rcvbulkpipe(stream->udev,
+					     stream->props.endpoint));
+	if (!ret && READ_ONCE(stream->running)) {
+		WRITE_ONCE(stream->recovering, false);
+		ret = usb_urb_submit_locked(stream, GFP_KERNEL);
+	}
+
+failed:
+	if (ret) {
+		dev_warn_ratelimited(&stream->udev->dev,
+				     "bulk stream recovery failed: %d\n", ret);
+		if (ret == -ENODEV || ret == -ESHUTDOWN || ret == -ENOENT ||
+		    ret == -EPERM)
+			WRITE_ONCE(stream->running, false);
+		else if (READ_ONCE(stream->running)) {
+			WRITE_ONCE(stream->recovering, true);
+			schedule_delayed_work(&stream->recovery_work,
+					     msecs_to_jiffies(USB_URB_RECOVERY_RETRY_MS));
+		}
+	}
+
+unlock:
+	mutex_unlock(&stream->recovery_lock);
+}
+
+int usb_urb_kill(struct usb_data_stream *stream)
+{
+	WRITE_ONCE(stream->running, false);
+	cancel_delayed_work_sync(&stream->recovery_work);
+
+	mutex_lock(&stream->recovery_lock);
+	usb_urb_kill_locked(stream);
+	WRITE_ONCE(stream->recovering, false);
+	mutex_unlock(&stream->recovery_lock);
+	return 0;
+}
+
+int usb_urb_submit(struct usb_data_stream *stream)
+{
+	int ret = 0;
+
+	mutex_lock(&stream->recovery_lock);
+	if (stream->props.type == USB_BULK)
+		ret = usb_clear_halt(stream->udev,
+				     usb_rcvbulkpipe(stream->udev,
+						     stream->props.endpoint));
+	if (!ret) {
+		WRITE_ONCE(stream->recovering, false);
+		WRITE_ONCE(stream->running, true);
+		ret = usb_urb_submit_locked(stream, GFP_ATOMIC);
+		if (ret)
+			WRITE_ONCE(stream->running, false);
+	}
+	mutex_unlock(&stream->recovery_lock);
+
+	if (ret)
+		cancel_delayed_work_sync(&stream->recovery_work);
+	return ret;
 }
 
 static int usb_free_stream_buffers(struct usb_data_stream *stream)
@@ -216,8 +369,10 @@ int usb_urb_init(struct usb_data_stream *stream, struct usb_data_stream_properti
 		return -EINVAL;
 
 	memcpy(&stream->props, props, sizeof(*props));
-
-	usb_clear_halt(stream->udev,usb_rcvbulkpipe(stream->udev,stream->props.endpoint));
+	mutex_init(&stream->recovery_lock);
+	INIT_DELAYED_WORK(&stream->recovery_work, usb_urb_recover);
+	WRITE_ONCE(stream->running, false);
+	WRITE_ONCE(stream->recovering, false);
 
 	if (stream->complete == NULL) {
 		err("there is no data callback - this doesn't make sense.");

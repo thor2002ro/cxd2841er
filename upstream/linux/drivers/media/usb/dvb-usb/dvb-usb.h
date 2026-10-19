@@ -15,6 +15,7 @@
 #include <linux/usb.h>
 #include <linux/firmware.h>
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
 #include <media/rc-core.h>
 
 #include <media/dvb_frontend.h>
@@ -332,11 +333,15 @@ struct dvb_usb_device_properties {
  *
  * @urbs_initialized: number of URBs initialized.
  * @urbs_submitted: number of URBs submitted.
+ * @recovery_lock: serializes stream start, stop and error recovery.
+ * @recovery_work: restarts a bulk stream after a transfer error.
+ * @running: whether the stream may submit or recover URBs.
  * @user_priv: for private use.
  */
 struct usb_data_stream {
 #define MAX_NO_URBS_FOR_DATA_STREAM 10
 	struct usb_device                 *udev;
+	struct usb_interface              *intf;
 	struct usb_data_stream_properties  props;
 
 #define USB_STATE_INIT    0x00
@@ -353,6 +358,10 @@ struct usb_data_stream {
 
 	int urbs_initialized;
 	int urbs_submitted;
+	struct mutex recovery_lock; /* Serializes stream state changes. */
+	struct delayed_work recovery_work;
+	bool running;
+	bool recovering;
 
 	void *user_priv;
 };
@@ -463,6 +472,7 @@ struct dvb_usb_device {
 	const struct dvb_usb_device_description *desc;
 
 	struct usb_device *udev;
+	struct usb_interface *intf;
 
 #define DVB_USB_STATE_INIT        0x000
 #define DVB_USB_STATE_I2C         0x001

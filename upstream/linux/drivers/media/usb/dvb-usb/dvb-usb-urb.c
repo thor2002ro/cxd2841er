@@ -95,6 +95,7 @@ int dvb_usb_adapter_stream_init(struct dvb_usb_adapter *adap)
 	for (i = 0; i < adap->props.num_frontends; i++) {
 
 		adap->fe_adap[i].stream.udev      = adap->dev->udev;
+		adap->fe_adap[i].stream.intf      = adap->dev->intf;
 		if (adap->props.fe[i].caps & DVB_USB_ADAP_RECEIVES_204_BYTE_TS)
 			adap->fe_adap[i].stream.complete =
 				dvb_usb_data_complete_204;
