@@ -24,6 +24,13 @@
 
 #define CXD2841ER_DVBS_POLLING_INVL	10
 
+#define CXD2841ER_STATS_STRENGTH		0x01
+#define CXD2841ER_STATS_CNR		0x02
+#define CXD2841ER_STATS_BLOCKS		0x04
+#define CXD2841ER_STATS_BITS		0x08
+#define CXD2841ER_STATS_QAM		0x10
+#define CXD2841ER_STATS_ALL		0x1f
+
 struct cxd2841er_cnr_data {
 	u32 value;
 	int cnr_x1000;

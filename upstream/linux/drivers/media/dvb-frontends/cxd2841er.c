@@ -29,12 +29,26 @@
 #include "cxd2841er_priv.h"
 
 /* Version this out-of-tree driver separately from the Linux kernel. */
-#define CXD2841ER_VERSION "1.1.10"
+#define CXD2841ER_VERSION "1.1.11"
 
 #define MAX_WRITE_REGSIZE	16
 #define LOG2_E_100X 144
 
 #define INTLOG10X100(x) ((u32) (((u64) intlog10(x) * 100) >> 24))
+
+/*
+ * Lock status is always read. Poll signal strength and CNR by default; the
+ * error counters and detected modulation remain opt-in.
+ */
+static unsigned int cxd2841er_stats_mask = CXD2841ER_STATS_STRENGTH |
+					  CXD2841ER_STATS_CNR;
+module_param_named(stats_mask, cxd2841er_stats_mask, uint, 0644);
+MODULE_PARM_DESC(stats_mask,
+	"DVB statistics bitmask; status is always read: 0=status only; "
+	"optional bits: 1=strength, 2=CNR, 4=block errors, 8=bit errors, "
+	"16=detected DVB-C QAM; combine bits: "
+	"19=status+strength+CNR+QAM (no block/bit errors), 31=all; "
+	"default=3 (status+strength+CNR)");
 
 /* DVB-C constellation */
 enum sony_dvbc_constellation_t {
@@ -4619,6 +4633,7 @@ static int cxd2841er_get_frontend(struct dvb_frontend *fe,
 	enum fe_status status = 0;
 	struct cxd2841er_priv *priv = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	unsigned int stats_mask = cxd2841er_stats_mask;
 
 	if (priv->state == STATE_ACTIVE_S)
 		ret = cxd2841er_read_status_s(fe, &status);
@@ -4635,7 +4650,8 @@ static int cxd2841er_get_frontend(struct dvb_frontend *fe,
 		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 		goto unavailable;
 	}
-	if (priv->state == STATE_ACTIVE_TC || priv->state == STATE_ACTIVE_S)
+	if ((stats_mask & CXD2841ER_STATS_STRENGTH) &&
+	    (priv->state == STATE_ACTIVE_TC || priv->state == STATE_ACTIVE_S))
 		cxd2841er_read_signal_strength(fe);
 	else
 		c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
@@ -4644,9 +4660,26 @@ static int cxd2841er_get_frontend(struct dvb_frontend *fe,
 		if (priv->stats_time && !time_after(jiffies, priv->stats_time))
 			goto copy;
 		priv->stats_time = jiffies + msecs_to_jiffies(1000);
-		cxd2841er_read_snr(fe);
-		cxd2841er_read_ucblocks(fe);
-		cxd2841er_read_ber(fe);
+		/*
+		 * Each monitor adds I2C traffic while TS is active. Keep the reads
+		 * separate so affected USB bridges can disable troublesome queries.
+		 */
+		if (stats_mask & CXD2841ER_STATS_CNR)
+			cxd2841er_read_snr(fe);
+		else
+			c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		if (stats_mask & CXD2841ER_STATS_BLOCKS)
+			cxd2841er_read_ucblocks(fe);
+		else
+			c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		if (stats_mask & CXD2841ER_STATS_BITS) {
+			cxd2841er_read_ber(fe);
+		} else {
+			c->pre_bit_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+			c->pre_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+			c->post_bit_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+			c->post_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+		}
 		goto copy;
 	}
 unavailable:
@@ -4665,7 +4698,8 @@ copy:
 	p->pre_bit_count = c->pre_bit_count;
 	p->post_bit_error = c->post_bit_error;
 	p->post_bit_count = c->post_bit_count;
-	if (!(status & FE_HAS_LOCK) || priv->system != SYS_DVBC_ANNEX_A ||
+	if (!(stats_mask & CXD2841ER_STATS_QAM) ||
+	    !(status & FE_HAS_LOCK) || priv->system != SYS_DVBC_ANNEX_A ||
 	    (c->delivery_system != SYS_DVBC_ANNEX_A &&
 	     c->delivery_system != SYS_DVBC_ANNEX_C))
 		return ret;
