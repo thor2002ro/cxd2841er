@@ -1,22 +1,38 @@
 # cxd2841er-fix
 
-Out-of-tree builds of the Sony CXD2841ER demodulator and Rafael Micro R820T/R828D
-tuner drivers. The Sony driver includes a
-reset-timing fix for the Astrometa DVB-T2 stick (RTL2832P + CXD2837ER + R828D,
-USB ID `15f4:0131`), I2C error handling for tuning and measurements, and isolated
-capabilities for each attached tuner.
+This repository builds patched Linux TV-tuner drivers for the Astrometa DVB-T2
+stick and the Xbox One Digital TV Tuner. It packages the ten affected DVB kernel
+modules and provides scripts to install or remove them without replacing the
+stock module files.
 
-## Version and debug logs
+## Version checks
 
-The Sony driver revision is **1.1.1**; the custom R820T driver is **1.0.1**.
-`CXD2841ER_VERSION` in `cxd2841er.c` is
-the version used by both the module metadata and the attachment log. Bump it
-when releasing subsequent driver changes.
+All ten custom modules expose a version through their module metadata:
+
+| Module | Version |
+| --- | --- |
+| `cxd2841er` | 1.1.11 |
+| `r820t` | 1.0.3 |
+| `mn88472` | 1.0.0 |
+| `rtl2832` | 1.0.0 |
+| `tda18250` | 1.0.0 |
+| `dvb-core` | 1.0.0 |
+| `dvb-usb` | 1.0.1 |
+| `dvb_usb_v2` | 2.0.1 |
+| `dvb-usb-dib0700` | 1.0.1 |
+| `dvb-usb-rtl28xxu` | 1.0.0 |
+
+`CXD2841ER_VERSION` in `cxd2841er.c` is used by both the module metadata and
+the attachment log. Bump the affected module's version when releasing later
+driver changes.
 
 ```sh
-modinfo -F version ./cxd2841er.ko    # local build
-modinfo -F version cxd2841er        # installed module file
-cat /sys/module/cxd2841er/version   # module currently running in the kernel
+for module in $(make -s module-names); do
+	printf '%s: ' "$module"
+	modinfo -F version "upstream/linux/$module.ko"
+done
+modinfo -F version cxd2841er       # installed module file
+cat /sys/module/cxd2841er/version  # module currently running in the kernel
 ```
 
 Check the running version as well as the file version: replacing a module on
@@ -24,8 +40,105 @@ disk does not replace a copy that is already loaded. A successful attachment
 also logs a line like:
 
 ```text
-cxd2841er v1.1.1: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
+cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 ```
+
+## Module changes
+
+### `cxd2841er` 1.1.11
+
+- Waits 15–20 ms after the Sony software reset, verifies that TS output was
+  enabled, and returns failed bank, reset, TS, tuner, gate and IF operations.
+- Checks register access throughout setup, tuning, power changes and
+  measurements. A failed tune invalidates cached state so later polling cannot
+  report an earlier lock; recovery reinitializes the demodulator when needed.
+- Keeps capabilities per frontend, validates chip identification and tuning
+  requests, and requires valid acquisition state for lock, carrier, CNR and
+  detected-QAM results.
+- Corrects DVB-C and satellite carrier calculations, DVB-S/S2 switching,
+  24/41 MHz crystal handling, signed/fractional CNR conversion and PRE/POST
+  error-counter placement.
+- Exposes `stats_mask`: status is always read; strength (`1`) and CNR (`2`) are
+  enabled by default, while block errors (`4`), bit errors (`8`) and detected
+  DVB-C QAM (`16`) remain optional.
+
+### `r820t` 1.0.3
+
+- Returns I2C, gate, calibration, standby and tuning failures instead of
+  continuing with stale state, including `-ETIMEDOUT` when the PLL does not
+  lock without an earlier I/O error.
+- Clears cached lock and standard state after failures, checks every remaining
+  calibration step, and preserves the original failure during gate cleanup.
+- Releases shared tuner state when attachment fails and reports AGC as an
+  uncalibrated relative strength rather than an invented dBm value.
+
+### `mn88472` 1.0.0
+
+- Writes firmware through the fixed program-data port, validates configuration
+  and transfer limits, identifies parity failures, and clears active/statistics
+  state before power or tune changes.
+- Rejects false DVB-T, DVB-T2 and DVB-C locks using the demodulator error flags,
+  QAM validity and VQLOCK instead of trusting acquisition stage alone.
+- Programs cable bandwidth and QAM, DVB-T mode and guard interval, and DVB-T2
+  PLP selection without leaking settings from a previous tune. Explicit PLP
+  IDs use ID lookup; the automatic fallback uses index lookup.
+- Reports detected DVB-T modulation, hierarchy, code rates, FFT and guard;
+  DVB-T2 modulation, code rate, FFT and guard; and DVB-C modulation and symbol
+  rate only after complete valid reads.
+- Keeps its state until the final frontend reference is released during USB
+  removal. Its `stats_mask` uses the same bits and strength-plus-CNR default as
+  the Sony module.
+
+### `rtl2832` 1.0.0
+
+- Stops frontend setup and returns the tuner `set_params` error instead of
+  programming the demodulator after a failed tuner operation.
+
+### `tda18250` 1.0.0
+
+- Validates platform data and chip-ID reads, returns the final charge-pump
+  write error, and fails probe if initial standby cannot be entered.
+- Uses the I2C client directly for power control so teardown does not depend on
+  a frontend pointer that may already be detached, and publishes tuner state
+  only after setup succeeds.
+
+### `dvb-core` 1.0.0
+
+- Wakes blocked demux and DVR readers during device removal and returns
+  `-ENODEV` instead of leaving them asleep.
+- Marks active mmap queues as failed and lets blocking `DMX_DQBUF` release the
+  mutex needed by device removal.
+
+### `dvb-usb` 1.0.1
+
+- Rolls back PID filters, the PID parser, streaming, URBs and feed counts when
+  the first legacy feed fails to start. Final-feed cleanup still completes if
+  stopping the device reports an error.
+- Exposes early frontend cleanup for bridge drivers, clears detached frontend
+  pointers, and preserves the original error while reporting rollback errors.
+
+### `dvb_usb_v2` 2.0.1
+
+- Initializes remote-control delayed work before any early return so cleanup
+  can always cancel it safely.
+- Rolls back submitted URBs, filters, streaming state and feed counts when any
+  stream-start stage fails, and wakes waiters after clearing the streaming bit.
+
+### `dvb-usb-dib0700` 1.0.1
+
+- Rejects short USB control and I2C transfers, guards transfer lengths, returns
+  clock/version errors, and cleans up a probe whose version read fails.
+- Stops the Xbox power/reset sequence on the first GPIO error and fully unwinds
+  partial demodulator or tuner attachment.
+- Detaches Xbox frontends before unregistering their tuner and demodulator I2C
+  clients, retaining module references until client removal is complete.
+
+### `dvb-usb-rtl28xxu` 1.0.0
+
+- Treats an incomplete USB control transfer as `-EIO` rather than accepting it
+  as a successful register operation.
+
+## Sony and R820T debug logs
 
 Failures are reported in `dmesg` without debug flags. Warnings cover I2C
 transfers, Sony tuner programming and checked gate callbacks, IF reads, reset/TS enable
@@ -155,18 +268,26 @@ Requires only the standard kernel build tree (headers + .config), no full kernel
 source:
 
 ```sh
-make                  # builds cxd2841er.ko and r820t.ko in this folder
-./build.sh install    # builds locally, then installs both modules (also the default)
-./build.sh uninstall  # removes these two modules from updates/, then runs depmod
+make                  # builds all ten modified modules
+./build.sh install    # builds locally, then installs the modified modules (also the default)
+./build.sh uninstall  # removes the modified modules from updates/, then runs depmod
 ```
 
 `make` detects `CONFIG_CC_IS_CLANG=y` in the kernel build tree and enables
 `LLVM=1` automatically; an explicit `LLVM` setting takes precedence.
-The script uses `sudo` to copy both local modules into the
-running kernel's `/lib/modules/$(uname -r)/updates/` directory and run `depmod`.
-Build against that exact kernel and architecture. Stop tuner users before
-manually reloading the drivers, or reboot after installation or removal.
-Uninstall preserves the stock kernel module files and the local build outputs.
+It requires every overridden driver to be configured as a module. When
+`CONFIG_DVB_CORE=m`, all ten modules are built. When `CONFIG_DVB_CORE=y`, the
+built-in core cannot be replaced, so the build warns, skips `dvb-core`, and
+builds the other nine modules; the core removal fixes are then absent.
+
+`build.sh` builds in parallel, gets the install/remove set from `module-names`,
+and validates every output file and its kernel release before copying anything.
+It supports `INSTALL_MOD_PATH` for staged roots and otherwise uses `sudo` to
+install under `/lib/modules/$(uname -r)/updates/`, then runs `depmod`. Build
+against that exact kernel and architecture. Stop tuner users before manually
+reloading the drivers, or reboot after installation or removal. Uninstall
+removes only these overrides, preserving stock kernel modules and local build
+outputs.
 
 ## Verify
 
@@ -285,11 +406,12 @@ error. Physical tuner behavior requires a hardware check.
 
 ## Notes
 
-- `cxd2841er.h`/`cxd2841er_priv.h` are the in-tree headers, vendored here.
-  The kernel build tree and its build tools are still required.
-- Root `r820t.c`, `r820t.h` and `tuner-i2c.h` are the custom tuner working copy;
-  the imported `upstream/` files remain unchanged as the comparison baseline.
+- The source set was imported from Linux
+  `58161ead29e50d70a317ea26b472e0c7508e69da` (7.3-rc7). Local changes are
+  applied directly under `upstream/linux/`; Git retains the clean baseline.
+- Headers and unchanged companion objects needed to link the ten modules are
+  vendored with the modified sources. The target kernel build tree and its
+  build tools are still required.
 - BTF metadata is generated by kbuild when the matching `vmlinux` and
   `pahole` are available; otherwise it may be skipped.
-- The driver is based on upstream Linux (GPL-2.0) with the reset delay,
-  tuning/measurement error handling, and per-frontend capability fixes above.
+- The drivers remain under their upstream Linux GPL licenses.

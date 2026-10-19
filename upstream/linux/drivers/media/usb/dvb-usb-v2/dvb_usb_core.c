@@ -1157,7 +1157,7 @@ int dvb_usbv2_reset_resume(struct usb_interface *intf)
 }
 EXPORT_SYMBOL(dvb_usbv2_reset_resume);
 
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.0.1");
 MODULE_AUTHOR("Patrick Boettcher <patrick.boettcher@posteo.de>");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("DVB USB common");

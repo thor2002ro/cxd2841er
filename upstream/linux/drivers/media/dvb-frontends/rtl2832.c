@@ -1145,6 +1145,7 @@ static struct i2c_driver rtl2832_driver = {
 
 module_i2c_driver(rtl2832_driver);
 
+MODULE_VERSION("1.0.0");
 MODULE_AUTHOR("Thomas Mair <mair.thomas86@gmail.com>");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("Realtek RTL2832 DVB-T demodulator driver");

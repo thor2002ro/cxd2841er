@@ -1132,6 +1132,7 @@ static void __exit exit_dvbdev(void)
 subsys_initcall(init_dvbdev);
 module_exit(exit_dvbdev);
 
+MODULE_VERSION("1.0.0");
 MODULE_DESCRIPTION("DVB Core Driver");
 MODULE_AUTHOR("Marcus Metzler, Ralph Metzler, Holger Waechtler");
 MODULE_LICENSE("GPL");

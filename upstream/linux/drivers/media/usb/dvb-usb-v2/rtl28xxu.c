@@ -2011,6 +2011,7 @@ static struct usb_driver rtl28xxu_usb_driver = {
 
 module_usb_driver(rtl28xxu_usb_driver);
 
+MODULE_VERSION("1.0.0");
 MODULE_DESCRIPTION("Realtek RTL28xxU DVB USB driver");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_AUTHOR("Thomas Mair <thomas.mair86@googlemail.com>");

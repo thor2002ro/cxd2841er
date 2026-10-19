@@ -979,5 +979,5 @@ module_usb_driver(dib0700_driver);
 MODULE_FIRMWARE("dvb-usb-dib0700-1.20.fw");
 MODULE_AUTHOR("Patrick Boettcher <patrick.boettcher@posteo.de>");
 MODULE_DESCRIPTION("Driver for devices based on DiBcom DiB0700 - USB bridge");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.0.1");
 MODULE_LICENSE("GPL");

@@ -1025,6 +1025,7 @@ static struct i2c_driver mn88472_driver = {
 
 module_i2c_driver(mn88472_driver);
 
+MODULE_VERSION("1.0.0");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("Panasonic MN88472 DVB-T/T2/C demodulator driver");
 MODULE_LICENSE("GPL");

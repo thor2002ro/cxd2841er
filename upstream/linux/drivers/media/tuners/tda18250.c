@@ -892,6 +892,7 @@ static struct i2c_driver tda18250_driver = {
 
 module_i2c_driver(tda18250_driver);
 
+MODULE_VERSION("1.0.0");
 MODULE_DESCRIPTION("NXP TDA18250 silicon tuner driver");
 MODULE_AUTHOR("Olli Salonen <olli.salonen@iki.fi>");
 MODULE_LICENSE("GPL");
