@@ -137,7 +137,8 @@
 #define MN88472_SET_PLL2_20_5MHZ			0x00
 #define MN88472_SET_PLL_ENABLE				0x01
 #define MN88472_SET_POWER_ON				0x00
-#define MN88472_SET_POWER_DOWN				0x3e
+/* Keep I2C/clock running: vendor sleep 0x3f requires a hardware reset. */
+#define MN88472_SET_POWER_STANDBY				0x3e
 #define MN88472_SET_OUTPUT1_ACTIVE			0x00
 #define MN88472_SET_OUTPUT1_SLEEP			0x30
 #define MN88472_SET_OUTPUT2_ACTIVE			0x00

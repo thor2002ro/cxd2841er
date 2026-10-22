@@ -715,8 +715,9 @@ static int mn88472_init(struct dvb_frontend *fe)
 	unsigned int utmp;
 	const struct firmware *firmware;
 	const char *name = MN88472_FIRMWARE;
+	const char *stage = "power-on";
 
-	dev_dbg(&client->dev, "\n");
+	dev_dbg(&client->dev, "initialization started\n");
 
 	/* Power up */
 	dev->active = false;
@@ -728,22 +729,29 @@ static int mn88472_init(struct dvb_frontend *fe)
 			   MN88472_SET_POWER_ON);
 	if (ret)
 		goto err;
+	stage = "output HIZ1 restore";
 	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_1,
 			   MN88472_SET_OUTPUT1_ACTIVE);
 	if (ret)
 		goto err;
+	stage = "output HIZ2 restore";
 	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_2,
 			   MN88472_SET_OUTPUT2_ACTIVE);
 	if (ret)
 		goto err;
 
 	/* Check if firmware is already running */
+	stage = "firmware status read";
 	ret = regmap_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_CONTROL, &utmp);
 	if (ret)
 		goto err;
+	dev_dbg(&client->dev, "firmware control=0x%02x: %s\n", utmp,
+		 utmp & MN88472_MASK_FIRMWARE_STOPPED ?
+		 "upload required" : "upload skipped (stop bit clear)");
 	if (!(utmp & MN88472_MASK_FIRMWARE_STOPPED))
 		goto warm;
 
+	stage = "firmware request";
 	ret = request_firmware(&firmware, name, &client->dev);
 	if (ret) {
 		dev_err(&client->dev, "firmware file '%s' not found\n", name);
@@ -752,6 +760,7 @@ static int mn88472_init(struct dvb_frontend *fe)
 
 	dev_info(&client->dev, "downloading firmware from file '%s'\n", name);
 
+	stage = "firmware upload";
 	if (!firmware->size || firmware->size > INT_MAX ||
 	    dev->i2c_write_max < 2) {
 		ret = -EINVAL;
@@ -792,6 +801,7 @@ static int mn88472_init(struct dvb_frontend *fe)
 
 	release_firmware(firmware);
 warm:
+	stage = "TS configuration";
 	/* TS config */
 	switch (dev->ts_mode) {
 	case SERIAL_TS_MODE:
@@ -824,12 +834,28 @@ warm:
 		goto err;
 
 	dev->active = true;
+	dev_dbg(&client->dev, "initialization completed\n");
 
 	return 0;
 err_release_firmware:
 	release_firmware(firmware);
 err:
-	dev_dbg(&client->dev, "failed=%d\n", ret);
+	dev_err(&client->dev, "initialization failed at %s: %d\n",
+		stage, ret);
+	return ret;
+}
+
+static int mn88472_power_sleep(struct mn88472_dev *dev)
+{
+	int ret;
+
+	/* Deep sleep stops I2C and requires a board-controlled hardware reset. */
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
+			   MN88472_SET_POWER_STANDBY);
+	if (ret)
+		dev_err(&dev->client[MN88472_BANK_DVBT]->dev,
+			"standby power-control write failed: %d\n", ret);
+
 	return ret;
 }
 
@@ -839,6 +865,7 @@ static int mn88472_sleep(struct dvb_frontend *fe)
 	struct mn88472_dev *dev = i2c_get_clientdata(client);
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret;
+	const char *stage = "output HIZ2";
 
 	dev_dbg(&client->dev, "\n");
 
@@ -852,18 +879,16 @@ static int mn88472_sleep(struct dvb_frontend *fe)
 			   MN88472_SET_OUTPUT2_SLEEP);
 	if (ret)
 		goto err;
+	stage = "output HIZ1";
 	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_1,
 			   MN88472_SET_OUTPUT1_SLEEP);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
-			   MN88472_SET_POWER_DOWN);
-	if (ret)
-		goto err;
 
-	return 0;
+	return mn88472_power_sleep(dev);
 err:
-	dev_dbg(&client->dev, "failed=%d\n", ret);
+	dev_err(&client->dev, "standby %s write failed: %d\n",
+		stage, ret);
 	return ret;
 }
 
@@ -1027,9 +1052,8 @@ static int mn88472_probe(struct i2c_client *client)
 		goto err_regmap_2_regmap_exit;
 	}
 
-	/* Sleep because chip is active by default */
-	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
-			   MN88472_SET_POWER_DOWN);
+	/* Standby because chip is active by default. */
+	ret = mn88472_power_sleep(dev);
 	if (ret)
 		goto err_regmap_2_regmap_exit;
 
