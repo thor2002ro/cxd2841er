@@ -50,51 +50,57 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
 	switch (c->delivery_system) {
 	case SYS_DVBT:
-		ret = regmap_read(dev->regmap[0], 0x7f, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT],
+				  MN88472_REG_DVBT_ACQUISITION_STATUS, &utmp);
 		if (ret)
 			goto err;
 		/* OFDM or mode-search errors invalidate the acquisition stage. */
-		if (!(utmp & 0xa0) && (utmp & 0x0f) >= 0x09)
+		if (!(utmp & MN88472_MASK_DVBT_ACQUISITION_ERROR) &&
+		    (utmp & MN88472_MASK_ACQUISITION_STAGE) >= MN88472_STAGE_DVBT_LOCK)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
 		else
 			*status = 0;
 		break;
 	case SYS_DVBT2:
-		ret = regmap_read(dev->regmap[2], 0x92, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2],
+				  MN88472_REG_DVBT2_ACQUISITION_STATUS, &utmp);
 		if (ret)
 			goto err;
 		/* P1 acquisition give-up invalidates the stage nibble. */
-		if (utmp & 0x40)
+		if (utmp & MN88472_MASK_DVBT2_P1_GIVE_UP)
 			*status = 0;
-		else if ((utmp & 0x0f) >= 0x0d)
+		else if ((utmp & MN88472_MASK_ACQUISITION_STAGE) >= MN88472_STAGE_DVBT2_LOCK)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
-		else if ((utmp & 0x0f) >= 0x0a)
+		else if ((utmp & MN88472_MASK_ACQUISITION_STAGE) >= MN88472_STAGE_DVBT2_FEC)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI;
-		else if ((utmp & 0x0f) >= 0x07)
+		else if ((utmp & MN88472_MASK_ACQUISITION_STAGE) >= MN88472_STAGE_DVBT2_CARRIER)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER;
 		else
 			*status = 0;
 		break;
 	case SYS_DVBC_ANNEX_A:
 		/* QAM errors or missing VQLOCK invalidate the acquisition stage. */
-		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC],
+				  MN88472_REG_DVBC_ACQUISITION_STATUS, &utmp);
 		if (ret)
 			goto err;
-		if (utmp & 0x40)
+		if (utmp & MN88472_MASK_DVBC_QAM_ERROR)
 			break;
-		ret = regmap_read(dev->regmap[1], 0x89, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC], MN88472_REG_DVBC_LOCK_STATUS,
+				  &utmp);
 		if (ret)
 			goto err;
-		if (!(utmp & 0x01))
+		if (!(utmp & MN88472_MASK_DVBC_VQ_LOCK))
 			break;
-		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC],
+				  MN88472_REG_DVBC_ACQUISITION_STAGE, &utmp);
 		if (ret)
 			goto err;
-		utmp &= 0x0f;
-		if (utmp == 0x08 || utmp == 0x09)
+		utmp &= MN88472_MASK_ACQUISITION_STAGE;
+		if (utmp == MN88472_STAGE_DVBC_LOCK_8 || utmp == MN88472_STAGE_DVBC_LOCK_9)
 			*status = FE_HAS_SIGNAL | FE_HAS_CARRIER |
 				  FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK;
 		else
@@ -109,14 +115,15 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	if ((stats_mask & MN88472_STATS_STRENGTH) &&
 	    (*status & FE_HAS_SIGNAL)) {
 		for (i = 0; i < 2; i++) {
-			ret = regmap_bulk_read(dev->regmap[2], 0x8e + i,
-					       &buf[i], 1);
+			ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBT2],
+					       MN88472_REG_AGC_HIGH + i, &buf[i], 1);
 			if (ret)
 				goto err;
 		}
 
 		/* The ten-bit AGC monitor is MSB-aligned across both registers. */
-		utmp1 = buf[0] << 8 | (buf[1] & 0xc0) | buf[0] >> 2;
+		utmp1 = buf[0] << MN88472_SHIFT_MIDDLE_BYTE |
+			 (buf[1] & MN88472_MASK_AGC_LOW) | buf[0] >> MN88472_AGC_REPEAT_SHIFT;
 		dev_dbg(&client->dev, "strength=%u\n", utmp1);
 
 		c->strength.stat[0].scale = FE_SCALE_RELATIVE;
@@ -129,16 +136,18 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	if ((stats_mask & MN88472_STATS_CNR) &&
 	    (*status & FE_HAS_VITERBI) && c->delivery_system == SYS_DVBT) {
 		/* DVB-T CNR */
-		ret = regmap_bulk_read(dev->regmap[0], 0x9c, buf, 2);
+		ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_CNR_HIGH,
+				       buf, 2);
 		if (ret)
 			goto err;
 
-		utmp = buf[0] << 8 | buf[1] << 0;
+		utmp = buf[0] << MN88472_SHIFT_MIDDLE_BYTE | buf[1] << MN88472_SHIFT_LOW_BYTE;
 		if (utmp) {
 			/* CNR[dB]: 10 * log10(65536 / value) + 2 */
 			/* log10(65536) = 80807124, 0.2 = 3355443 */
-			stmp = ((u64)80807124 - intlog10(utmp) + 3355443)
-			       * 10000 >> 24;
+			stmp = ((u64)MN88472_LOG10_65536_Q24 - intlog10(utmp)
+			       + MN88472_CNR_OFFSET_0_2_Q24)
+			       * MN88472_CNR_MILLIDB_SCALE >> MN88472_LOG_FRACTION_BITS;
 
 			dev_dbg(&client->dev, "cnr=%d value=%u\n", stmp, utmp);
 		} else {
@@ -152,27 +161,30 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		   c->delivery_system == SYS_DVBT2) {
 		/* DVB-T2 CNR */
 		for (i = 0; i < 3; i++) {
-			ret = regmap_bulk_read(dev->regmap[2], 0xbc + i,
-					       &buf[i], 1);
+			ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBT2],
+					       MN88472_REG_DVBT2_CNR_FLAGS + i, &buf[i], 1);
 			if (ret)
 				goto err;
 		}
 
-		utmp = buf[1] << 8 | buf[2] << 0;
-		utmp1 = (buf[0] >> 2) & 0x01; /* 0=SISO, 1=MISO */
+		utmp = buf[1] << MN88472_SHIFT_MIDDLE_BYTE | buf[2] << MN88472_SHIFT_LOW_BYTE;
+		utmp1 = (buf[0] >> MN88472_CNR_MISO_SHIFT) &
+			MN88472_MASK_CNR_MISO; /* 0=SISO, 1=MISO */
 		if (utmp) {
 			if (utmp1) {
 				/* CNR[dB]: 10 * log10(16384 / value) - 6 */
 				/* log10(16384) = 70706234, 0.6 = 10066330 */
-				stmp = ((u64)70706234 - intlog10(utmp)
-				       - 10066330) * 10000 >> 24;
+				stmp = ((u64)MN88472_LOG10_16384_Q24 - intlog10(utmp)
+				       - MN88472_CNR_OFFSET_0_6_Q24) * MN88472_CNR_MILLIDB_SCALE
+				       >> MN88472_LOG_FRACTION_BITS;
 				dev_dbg(&client->dev, "cnr=%d value=%u MISO\n",
 					stmp, utmp);
 			} else {
 				/* CNR[dB]: 10 * log10(65536 / value) + 2 */
 				/* log10(65536) = 80807124, 0.2 = 3355443 */
-				stmp = ((u64)80807124 - intlog10(utmp)
-				       + 3355443) * 10000 >> 24;
+				stmp = ((u64)MN88472_LOG10_65536_Q24 - intlog10(utmp)
+				       + MN88472_CNR_OFFSET_0_2_Q24) * MN88472_CNR_MILLIDB_SCALE
+				       >> MN88472_LOG_FRACTION_BITS;
 
 				dev_dbg(&client->dev, "cnr=%d value=%u SISO\n",
 					stmp, utmp);
@@ -187,17 +199,21 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		   (*status & FE_HAS_VITERBI) &&
 		   c->delivery_system == SYS_DVBC_ANNEX_A) {
 		/* DVB-C CNR */
-		ret = regmap_bulk_read(dev->regmap[1], 0xa1, buf, 4);
+		ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBC],
+				       MN88472_REG_DVBC_SIGNAL_NOISE, buf, 4);
 		if (ret)
 			goto err;
 
-		utmp1 = buf[0] << 8 | buf[1] << 0; /* signal */
-		utmp2 = buf[2] << 8 | buf[3] << 0; /* noise */
+		utmp1 = buf[0] << MN88472_SHIFT_MIDDLE_BYTE |
+			 buf[1] << MN88472_SHIFT_LOW_BYTE; /* signal */
+		utmp2 = buf[2] << MN88472_SHIFT_MIDDLE_BYTE |
+			 buf[3] << MN88472_SHIFT_LOW_BYTE; /* noise */
 		if (utmp1 && utmp2) {
 			/* CNR[dB]: 10 * log10(8 * (signal / noise)) */
 			/* log10(8) = 15151336 */
-			stmp = ((u64)15151336 + intlog10(utmp1)
-			       - intlog10(utmp2)) * 10000 >> 24;
+			stmp = ((u64)MN88472_LOG10_8_Q24 + intlog10(utmp1)
+			       - intlog10(utmp2)) * MN88472_CNR_MILLIDB_SCALE
+			       >> MN88472_LOG_FRACTION_BITS;
 
 			dev_dbg(&client->dev, "cnr=%d signal=%u noise=%u\n",
 				stmp, utmp1, utmp2);
@@ -214,12 +230,13 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	/* PER */
 	if ((stats_mask & MN88472_STATS_BLOCKS) &&
 	    (*status & FE_HAS_SYNC)) {
-		ret = regmap_bulk_read(dev->regmap[0], 0xe1, buf, 4);
+		ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBT],
+				       MN88472_REG_PACKET_ERROR_HIGH, buf, 4);
 		if (ret)
 			goto err;
 
-		utmp1 = buf[0] << 8 | buf[1] << 0;
-		utmp2 = buf[2] << 8 | buf[3] << 0;
+		utmp1 = buf[0] << MN88472_SHIFT_MIDDLE_BYTE | buf[1] << MN88472_SHIFT_LOW_BYTE;
+		utmp2 = buf[2] << MN88472_SHIFT_MIDDLE_BYTE | buf[3] << MN88472_SHIFT_LOW_BYTE;
 		dev_dbg(&client->dev, "block_error=%u block_count=%u\n",
 			utmp1, utmp2);
 
@@ -296,72 +313,91 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 		return 0;
 
 	if (c->delivery_system == SYS_DVBT2) {
-		ret = regmap_read(dev->regmap[2], 0x92, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2],
+				  MN88472_REG_DVBT2_ACQUISITION_STATUS, &utmp);
 		if (ret)
 			goto err;
-		if ((utmp & 0x40) || (utmp & 0x0f) < 13)
+		if ((utmp & MN88472_MASK_DVBT2_P1_GIVE_UP) ||
+		    (utmp & MN88472_MASK_ACQUISITION_STAGE) < MN88472_STAGE_DVBT2_LOCK)
 			return 0;
-		ret = regmap_read(dev->regmap[2], 0x93, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_FFT_MODE,
+				  &utmp);
 		if (ret)
 			goto err;
 		buf[0] = utmp;
 
 		/* Preserve C4's upper control bits when selecting the L1 monitor. */
-		ret = regmap_update_bits(dev->regmap[2], 0xc4, 0x1f, 0x00);
+		ret = regmap_update_bits(dev->regmap[MN88472_BANK_DVBT2],
+					 MN88472_REG_DVBT2_L1_SELECTOR, MN88472_MASK_L1_SELECTOR,
+					 MN88472_SET_L1_MONITOR);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[2], 0xc5, 0x00);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_L1_PAGE,
+				   MN88472_SET_L1_COMMON_PAGE);
 		if (ret)
 			goto err;
-		ret = regmap_read(dev->regmap[2], 0xc8, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_L1_DATA_3,
+				  &utmp);
 		if (ret)
 			goto err;
 		buf[1] = utmp;
-		ret = regmap_write(dev->regmap[2], 0xc5, 0x03);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_L1_PAGE,
+				   MN88472_SET_L1_PLP_PAGE);
 		if (ret)
 			goto err;
-		ret = regmap_read(dev->regmap[2], 0xc7, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_L1_DATA_2,
+				  &utmp);
 		if (ret)
 			goto err;
 
-		c->transmission_mode = t2_transmission_mode[buf[0] & 0x07];
-		c->guard_interval = t2_guard_interval[(buf[1] >> 4) & 0x07];
-		c->modulation = t2_modulation[(utmp >> 5) & 0x07];
-		c->fec_inner = t2_code_rate[(utmp >> 2) & 0x07];
+		c->transmission_mode = t2_transmission_mode[buf[0] & MN88472_MASK_THREE_BITS];
+		c->guard_interval = t2_guard_interval[(buf[1] >> MN88472_T2_GUARD_SHIFT) &
+			MN88472_MASK_THREE_BITS];
+		c->modulation = t2_modulation[(utmp >> MN88472_T2_MODULATION_SHIFT) &
+			MN88472_MASK_THREE_BITS];
+		c->fec_inner = t2_code_rate[(utmp >> MN88472_T2_CODE_RATE_SHIFT) &
+			MN88472_MASK_THREE_BITS];
 		return 0;
 	}
 	if (c->delivery_system == SYS_DVBC_ANNEX_A) {
-		ret = regmap_read(dev->regmap[1], 0x85, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC],
+				  MN88472_REG_DVBC_ACQUISITION_STATUS, &utmp);
 		if (ret)
 			goto err;
-		if (utmp & 0x40)
+		if (utmp & MN88472_MASK_DVBC_QAM_ERROR)
 			return 0;
-		ret = regmap_read(dev->regmap[1], 0x89, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC], MN88472_REG_DVBC_LOCK_STATUS,
+				  &utmp);
 		if (ret)
 			goto err;
-		if (!(utmp & 0x01))
+		if (!(utmp & MN88472_MASK_DVBC_VQ_LOCK))
 			return 0;
-		ret = regmap_read(dev->regmap[1], 0x84, &utmp);
+		ret = regmap_read(dev->regmap[MN88472_BANK_DVBC],
+				  MN88472_REG_DVBC_ACQUISITION_STAGE, &utmp);
 		if (ret)
 			goto err;
-		utmp &= 0x0f;
-		if (utmp != 0x08 && utmp != 0x09)
+		utmp &= MN88472_MASK_ACQUISITION_STAGE;
+		if (utmp != MN88472_STAGE_DVBC_LOCK_8 && utmp != MN88472_STAGE_DVBC_LOCK_9)
 			return 0;
 		/* QAM detection is optional, but symbol-rate readback stays available. */
 		if (stats_mask & MN88472_STATS_QAM) {
-			ret = regmap_read(dev->regmap[1], 0x83, &utmp);
+			ret = regmap_read(dev->regmap[MN88472_BANK_DVBC],
+					  MN88472_REG_DVBC_QAM_MONITOR, &utmp);
 			if (ret)
 				goto err;
-			cable_qam = utmp & 0x07;
+			cable_qam = utmp & MN88472_MASK_THREE_BITS;
 		}
 		if (dev->clk == 20500000) {
-			ret = regmap_bulk_read(dev->regmap[1], 0x86, buf, 3);
+			ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBC],
+					       MN88472_REG_DVBC_SYMBOL_RATE_HIGH, buf, 3);
 			if (ret)
 				goto err;
-			utmp = buf[0] << 16 | buf[1] << 8 | buf[2];
+			utmp = buf[0] << MN88472_SHIFT_HIGH_BYTE |
+				 buf[1] << MN88472_SHIFT_MIDDLE_BYTE | buf[2];
 			if (utmp) {
 				/* This PLL setup uses a 20.5 MHz ADC clock. */
-				symbol_rate = DIV_ROUND_CLOSEST_ULL(20500000ULL << 18, utmp);
+				symbol_rate = DIV_ROUND_CLOSEST_ULL(
+					20500000ULL << MN88472_SYMBOL_RATE_FRACTION_BITS, utmp);
 				if (symbol_rate <= U32_MAX)
 					c->symbol_rate = symbol_rate;
 			}
@@ -374,23 +410,29 @@ static int mn88472_get_frontend(struct dvb_frontend *fe,
 	if (c->delivery_system != SYS_DVBT)
 		return 0;
 
-	ret = regmap_read(dev->regmap[0], 0x7f, &utmp);
+	ret = regmap_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_ACQUISITION_STATUS,
+			  &utmp);
 	if (ret)
 		goto err;
-	if ((utmp & 0xa0) || (utmp & 0x0f) < 9)
+	if ((utmp & MN88472_MASK_DVBT_ACQUISITION_ERROR) ||
+	    (utmp & MN88472_MASK_ACQUISITION_STAGE) < MN88472_STAGE_DVBT_LOCK)
 		return 0;
 
 	/* Read decoded TPS only; status sampling also accumulates counters. */
-	ret = regmap_bulk_read(dev->regmap[0], 0x89, buf, sizeof(buf));
+	ret = regmap_bulk_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_TPS, buf,
+			       sizeof(buf));
 	if (ret)
 		goto err;
 
-	c->modulation = modulation[(buf[0] >> 3) & 0x03];
-	c->hierarchy = hierarchy[buf[0] & 0x07];
-	c->code_rate_HP = code_rate[(buf[1] >> 3) & 0x07];
-	c->code_rate_LP = code_rate[buf[1] & 0x07];
-	c->transmission_mode = transmission_mode[buf[2] & 0x03];
-	c->guard_interval = guard_interval[(buf[2] >> 2) & 0x03];
+	c->modulation = modulation[(buf[0] >> MN88472_TPS_MODULATION_SHIFT) &
+		MN88472_MASK_TWO_BITS];
+	c->hierarchy = hierarchy[buf[0] & MN88472_MASK_THREE_BITS];
+	c->code_rate_HP = code_rate[(buf[1] >> MN88472_TPS_HP_CODE_RATE_SHIFT) &
+		MN88472_MASK_THREE_BITS];
+	c->code_rate_LP = code_rate[buf[1] & MN88472_MASK_THREE_BITS];
+	c->transmission_mode = transmission_mode[buf[2] & MN88472_MASK_TWO_BITS];
+	c->guard_interval = guard_interval[(buf[2] >> MN88472_TPS_GUARD_SHIFT) &
+		MN88472_MASK_TWO_BITS];
 
 	return 0;
 err:
@@ -424,25 +466,25 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 
 	switch (c->delivery_system) {
 	case SYS_DVBT:
-		delivery_system_val = 0x02;
-		reg_bank0_b4_val = 0x00;
-		reg_bank0_cd_val = 0x1f;
-		reg_bank0_d4_val = 0x0a;
-		reg_bank0_d6_val = 0x48;
+		delivery_system_val = MN88472_SET_SYSTEM_DVBT;
+		reg_bank0_b4_val = MN88472_SET_AGCREF_DVBT_C;
+		reg_bank0_cd_val = MN88472_SET_IMPSET_DVBT;
+		reg_bank0_d4_val = MN88472_SET_FDAGCSET_DVBT;
+		reg_bank0_d6_val = MN88472_SET_TGAINSET_DVBT_C;
 		break;
 	case SYS_DVBT2:
-		delivery_system_val = 0x03;
-		reg_bank0_b4_val = 0xf6;
-		reg_bank0_cd_val = 0x01;
-		reg_bank0_d4_val = 0x09;
-		reg_bank0_d6_val = 0x46;
+		delivery_system_val = MN88472_SET_SYSTEM_DVBT2;
+		reg_bank0_b4_val = MN88472_SET_AGCREF_DVBT2;
+		reg_bank0_cd_val = MN88472_SET_IMPSET_DVBT2;
+		reg_bank0_d4_val = MN88472_SET_FDAGCSET_DVBT2_C;
+		reg_bank0_d6_val = MN88472_SET_TGAINSET_DVBT2;
 		break;
 	case SYS_DVBC_ANNEX_A:
-		delivery_system_val = 0x04;
-		reg_bank0_b4_val = 0x00;
-		reg_bank0_cd_val = 0x17;
-		reg_bank0_d4_val = 0x09;
-		reg_bank0_d6_val = 0x48;
+		delivery_system_val = MN88472_SET_SYSTEM_DVBC;
+		reg_bank0_b4_val = MN88472_SET_AGCREF_DVBT_C;
+		reg_bank0_cd_val = MN88472_SET_IMPSET_DVBC;
+		reg_bank0_d4_val = MN88472_SET_FDAGCSET_DVBT2_C;
+		reg_bank0_d6_val = MN88472_SET_TGAINSET_DVBT_C;
 		break;
 	default:
 		ret = -EINVAL;
@@ -455,19 +497,19 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		switch (c->bandwidth_hz) {
 		case 5000000:
 			bandwidth_vals_ptr = "\xe5\x99\x9a\x1b\xa9\x1b\xa9";
-			bandwidth_val = 0x03;
+			bandwidth_val = MN88472_SET_BANDWIDTH_5MHZ;
 			break;
 		case 6000000:
 			bandwidth_vals_ptr = "\xbf\x55\x55\x15\x6b\x15\x6b";
-			bandwidth_val = 0x02;
+			bandwidth_val = MN88472_SET_BANDWIDTH_6MHZ;
 			break;
 		case 7000000:
 			bandwidth_vals_ptr = "\xa4\x00\x00\x0f\x2c\x0f\x2c";
-			bandwidth_val = 0x01;
+			bandwidth_val = MN88472_SET_BANDWIDTH_7MHZ;
 			break;
 		case 8000000:
 			bandwidth_vals_ptr = "\x8f\x80\x00\x08\xee\x08\xee";
-			bandwidth_val = 0x00;
+			bandwidth_val = MN88472_SET_BANDWIDTH_8MHZ;
 			break;
 		default:
 			ret = -EINVAL;
@@ -476,7 +518,7 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		break;
 	case SYS_DVBC_ANNEX_A:
 		bandwidth_vals_ptr = "\x8f\x80\x00\x08\xee\x08\xee";
-		bandwidth_val = 0x00;
+		bandwidth_val = MN88472_SET_BANDWIDTH_8MHZ;
 		break;
 	default:
 		break;
@@ -500,29 +542,34 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		goto err;
 	}
 
-	ret = regmap_write(dev->regmap[2], 0x00, 0x66);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_PLL_SETTING_1,
+			   MN88472_SET_PLL1_20_5MHZ);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x01, 0x00);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_PLL_SETTING_2,
+			   MN88472_SET_PLL2_20_5MHZ);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x02, 0x01);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_PLL_CONTROL,
+			   MN88472_SET_PLL_ENABLE);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x03, delivery_system_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DELIVERY_SYSTEM,
+			   delivery_system_val);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x04, bandwidth_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_BANDWIDTH, bandwidth_val);
 	if (ret)
 		goto err;
 
 	/* IF */
-	utmp = DIV_ROUND_CLOSEST_ULL((u64)if_frequency * 0x1000000, dev->clk);
-	buf[0] = (utmp >> 16) & 0xff;
-	buf[1] = (utmp >>  8) & 0xff;
-	buf[2] = (utmp >>  0) & 0xff;
+	utmp = DIV_ROUND_CLOSEST_ULL((u64)if_frequency * MN88472_IF_NCO_SCALE, dev->clk);
+	buf[0] = (utmp >> MN88472_SHIFT_HIGH_BYTE) & MN88472_MASK_BYTE;
+	buf[1] = (utmp >>  MN88472_SHIFT_MIDDLE_BYTE) & MN88472_MASK_BYTE;
+	buf[2] = (utmp >>  MN88472_SHIFT_LOW_BYTE) & MN88472_MASK_BYTE;
 	for (i = 0; i < 3; i++) {
-		ret = regmap_write(dev->regmap[2], 0x10 + i, buf[i]);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_IF_NCO_HIGH + i,
+				   buf[i]);
 		if (ret)
 			goto err;
 	}
@@ -530,28 +577,32 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 	/* Bandwidth */
 	if (bandwidth_vals_ptr) {
 		for (i = 0; i < 7; i++) {
-			ret = regmap_write(dev->regmap[2], 0x13 + i,
+			ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2],
+					   MN88472_REG_BANDWIDTH_COEFFICIENTS + i,
 					   bandwidth_vals_ptr[i]);
 			if (ret)
 				goto err;
 		}
 	}
 
-	ret = regmap_write(dev->regmap[0], 0x46,
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_FILTER_2,
 			   (c->delivery_system == SYS_DVBT &&
-			    c->bandwidth_hz == 7000000) ? 0x10 : 0x00);
+			    c->bandwidth_hz == 7000000) ?
+			   MN88472_SET_DVBT_FILTER_7MHZ :
+			   MN88472_SET_DVBT_FILTER_DEFAULT);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[0], 0xb4, reg_bank0_b4_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_AGC_REFERENCE,
+			   reg_bank0_b4_val);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[0], 0xcd, reg_bank0_cd_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_IMPSET, reg_bank0_cd_val);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[0], 0xd4, reg_bank0_d4_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FDAGCSET, reg_bank0_d4_val);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[0], 0xd6, reg_bank0_d6_val);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_TGAINSET, reg_bank0_d6_val);
 	if (ret)
 		goto err;
 
@@ -560,68 +611,80 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 		if ((c->transmission_mode == TRANSMISSION_MODE_2K ||
 		     c->transmission_mode == TRANSMISSION_MODE_8K) &&
 		    (unsigned int)c->guard_interval <= GUARD_INTERVAL_1_4) {
-			reg_bank0_00_val = 0xf0 |
+			reg_bank0_00_val = MN88472_SET_DVBT_MODE_MANUAL |
 				(c->transmission_mode == TRANSMISSION_MODE_8K ?
-				 0x08 : 0x00) | c->guard_interval;
-			reg_bank0_01_val = 0x00;
+				 MN88472_SET_DVBT_MODE_8K : MN88472_SET_DVBT_MODE_2K) |
+				c->guard_interval;
+			reg_bank0_01_val = MN88472_SET_DVBT_MODE_SEARCH_OFF;
 		} else {
-			reg_bank0_00_val = 0xba;
-			reg_bank0_01_val = 0x13;
+			reg_bank0_00_val = MN88472_SET_DVBT_MODE_AUTO;
+			reg_bank0_01_val = MN88472_SET_DVBT_MODE_SEARCH_AUTO;
 		}
-		ret = regmap_write(dev->regmap[0], 0x07, 0x26);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT],
+				   MN88472_REG_DVBT_SEARCH_TIMEOUT_2,
+				   MN88472_SET_DVBT_SEARCH_TIMEOUT);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[0], 0x00, reg_bank0_00_val);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_MODE,
+				   reg_bank0_00_val);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[0], 0x01, reg_bank0_01_val);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_DVBT_MODE_SEARCH,
+				   reg_bank0_01_val);
 		if (ret)
 			goto err;
 		break;
 	case SYS_DVBT2:
-		ret = regmap_write(dev->regmap[2], 0x2b, 0x13);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_WIDE_AFC_3,
+				   MN88472_SET_DVBT2_WAFC);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[2], 0x4f, 0x05);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_DETECTION_2,
+				   MN88472_SET_DVBT2_DETECTION);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[1], 0xf6, 0x05);
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBC], MN88472_REG_FECSET3,
+				   MN88472_SET_DVBT2_FEC3);
 		if (ret)
 			goto err;
 		/* Explicit IDs and the ordinal-zero fallback use different modes. */
-		ret = regmap_update_bits(dev->regmap[2], 0x30, 0x80,
-					 c->stream_id > 0xff ? 0x80 : 0x00);
+		ret = regmap_update_bits(dev->regmap[MN88472_BANK_DVBT2],
+					 MN88472_REG_DVBT2_FEC_PLP_MODE, MN88472_MASK_PLP_ORDINAL,
+					 c->stream_id > MN88472_PLP_ID_MAX ?
+					 MN88472_SET_PLP_ORDINAL :
+					 MN88472_SET_PLP_EXPLICIT_ID);
 		if (ret)
 			goto err;
-		ret = regmap_write(dev->regmap[2], 0x32,
-				(c->stream_id > 0xff) ? 0 :
-				c->stream_id );
+		ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_DVBT2_PLP_ID,
+				   (c->stream_id > MN88472_PLP_ID_MAX) ?
+				   MN88472_SET_PLP_FIRST : c->stream_id);
 		if (ret)
 			goto err;
 		break;
 	case SYS_DVBC_ANNEX_A:
 		switch (c->modulation) {
 		case QAM_16:
-			reg_bank1_00_val = 0x0c;
+			reg_bank1_00_val = MN88472_SET_QAM16;
 			break;
 		case QAM_32:
-			reg_bank1_00_val = 0x0b;
+			reg_bank1_00_val = MN88472_SET_QAM32;
 			break;
 		case QAM_64:
-			reg_bank1_00_val = 0x08;
+			reg_bank1_00_val = MN88472_SET_QAM64;
 			break;
 		case QAM_128:
-			reg_bank1_00_val = 0x0a;
+			reg_bank1_00_val = MN88472_SET_QAM128;
 			break;
 		case QAM_256:
-			reg_bank1_00_val = 0x09;
+			reg_bank1_00_val = MN88472_SET_QAM256;
 			break;
 		default:
-			reg_bank1_00_val = 0x00;
+			reg_bank1_00_val = MN88472_SET_QAM_AUTO;
 			break;
 		}
 		/* Replace the whole field so retunes can return to automatic search. */
-		ret = regmap_update_bits(dev->regmap[1], 0x00, 0x0f,
+		ret = regmap_update_bits(dev->regmap[MN88472_BANK_DVBC],
+					 MN88472_REG_DVBC_QAM_SEARCH, MN88472_MASK_QAM_SEARCH,
 					 reg_bank1_00_val);
 		if (ret)
 			goto err;
@@ -631,7 +694,8 @@ static int mn88472_set_frontend(struct dvb_frontend *fe)
 	}
 
 	/* Reset the FSM and allow the demodulator to settle before polling it. */
-	ret = regmap_write(dev->regmap[2], 0xf8, 0x9f);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_RESET_CONTROL,
+			   MN88472_SET_RESET_DEMODULATOR);
 	if (ret)
 		goto err;
 	usleep_range(10000, 11000);
@@ -660,21 +724,24 @@ static int mn88472_init(struct dvb_frontend *fe)
 	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-	ret = regmap_write(dev->regmap[2], 0x05, 0x00);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
+			   MN88472_SET_POWER_ON);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x0b, 0x00);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_1,
+			   MN88472_SET_OUTPUT1_ACTIVE);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x0c, 0x00);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_2,
+			   MN88472_SET_OUTPUT2_ACTIVE);
 	if (ret)
 		goto err;
 
 	/* Check if firmware is already running */
-	ret = regmap_read(dev->regmap[0], 0xf5, &utmp);
+	ret = regmap_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_CONTROL, &utmp);
 	if (ret)
 		goto err;
-	if (!(utmp & 0x01))
+	if (!(utmp & MN88472_MASK_FIRMWARE_STOPPED))
 		goto warm;
 
 	ret = request_firmware(&firmware, name, &client->dev);
@@ -691,16 +758,16 @@ static int mn88472_init(struct dvb_frontend *fe)
 		goto err_release_firmware;
 	}
 
-	ret = regmap_write(dev->regmap[0], 0xf5, 0x03);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_CONTROL,
+			   MN88472_SET_FIRMWARE_LOAD);
 	if (ret)
 		goto err_release_firmware;
 
 	for (rem = firmware->size; rem > 0; rem -= (dev->i2c_write_max - 1)) {
 		len = min(dev->i2c_write_max - 1, rem);
 		/* F6 is a fixed program-data port, including split transfers. */
-		ret = regmap_noinc_write(dev->regmap[0], 0xf6,
-					 &firmware->data[firmware->size - rem],
-					 len);
+		ret = regmap_noinc_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_DATA,
+					 &firmware->data[firmware->size - rem], len);
 		if (ret) {
 			dev_err(&client->dev, "firmware download failed %d\n",
 				ret);
@@ -709,16 +776,17 @@ static int mn88472_init(struct dvb_frontend *fe)
 	}
 
 	/* Parity check of firmware */
-	ret = regmap_read(dev->regmap[0], 0xf8, &utmp);
+	ret = regmap_read(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_FLAGS, &utmp);
 	if (ret)
 		goto err_release_firmware;
-	if (utmp & 0x10) {
+	if (utmp & MN88472_MASK_FIRMWARE_PARITY_ERROR) {
 		ret = -EINVAL;
 		dev_err(&client->dev, "firmware parity check failed\n");
 		goto err_release_firmware;
 	}
 
-	ret = regmap_write(dev->regmap[0], 0xf5, 0x00);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_FIRMWARE_CONTROL,
+			   MN88472_SET_FIRMWARE_RUN);
 	if (ret)
 		goto err_release_firmware;
 
@@ -727,31 +795,31 @@ warm:
 	/* TS config */
 	switch (dev->ts_mode) {
 	case SERIAL_TS_MODE:
-		utmp = 0x1d;
+		utmp = MN88472_SET_TS_SERIAL;
 		break;
 	case PARALLEL_TS_MODE:
-		utmp = 0x00;
+		utmp = MN88472_SET_TS_PARALLEL;
 		break;
 	default:
 		ret = -EINVAL;
 		goto err;
 	}
-	ret = regmap_write(dev->regmap[2], 0x08, utmp);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_TS_FORMAT, utmp);
 	if (ret)
 		goto err;
 
 	switch (dev->ts_clk) {
 	case VARIABLE_TS_CLOCK:
-		utmp = 0xe3;
+		utmp = MN88472_SET_TS_CLOCK_VARIABLE;
 		break;
 	case FIXED_TS_CLOCK:
-		utmp = 0xe1;
+		utmp = MN88472_SET_TS_CLOCK_FIXED;
 		break;
 	default:
 		ret = -EINVAL;
 		goto err;
 	}
-	ret = regmap_write(dev->regmap[0], 0xd9, utmp);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT], MN88472_REG_TS_FIFO, utmp);
 	if (ret)
 		goto err;
 
@@ -780,13 +848,16 @@ static int mn88472_sleep(struct dvb_frontend *fe)
 	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-	ret = regmap_write(dev->regmap[2], 0x0c, 0x30);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_2,
+			   MN88472_SET_OUTPUT2_SLEEP);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x0b, 0x30);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_OUTPUT_HIZ_1,
+			   MN88472_SET_OUTPUT1_SLEEP);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[2], 0x05, 0x3e);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
+			   MN88472_SET_POWER_DOWN);
 	if (ret)
 		goto err;
 
@@ -895,10 +966,12 @@ static int mn88472_probe(struct i2c_client *client)
 	dev->clk = pdata->xtal;
 	dev->ts_mode = pdata->ts_mode;
 	dev->ts_clk = pdata->ts_clock;
-	dev->client[0] = client;
-	dev->regmap[0] = regmap_init_i2c(dev->client[0], &regmap_config);
-	if (IS_ERR(dev->regmap[0])) {
-		ret = PTR_ERR(dev->regmap[0]);
+	dev->client[MN88472_BANK_DVBT] = client;
+	dev->regmap[MN88472_BANK_DVBT] =
+		regmap_init_i2c(dev->client[MN88472_BANK_DVBT],
+				&regmap_config);
+	if (IS_ERR(dev->regmap[MN88472_BANK_DVBT])) {
+		ret = PTR_ERR(dev->regmap[MN88472_BANK_DVBT]);
 		goto err_kfree;
 	}
 
@@ -910,46 +983,53 @@ static int mn88472_probe(struct i2c_client *client)
 	 * Also, register bank 2 do not support sequential I/O. Only single
 	 * register write or read is allowed to that bank.
 	 */
-	dev->client[1] = i2c_new_dummy_device(client->adapter, 0x1a);
-	if (IS_ERR(dev->client[1])) {
-		ret = PTR_ERR(dev->client[1]);
+	dev->client[MN88472_BANK_DVBC] =
+		i2c_new_dummy_device(client->adapter, MN88472_I2C_ADDR_DVBC);
+	if (IS_ERR(dev->client[MN88472_BANK_DVBC])) {
+		ret = PTR_ERR(dev->client[MN88472_BANK_DVBC]);
 		dev_err(&client->dev, "I2C registration failed\n");
 		goto err_regmap_0_regmap_exit;
 	}
-	dev->regmap[1] = regmap_init_i2c(dev->client[1], &regmap_config);
-	if (IS_ERR(dev->regmap[1])) {
-		ret = PTR_ERR(dev->regmap[1]);
+	dev->regmap[MN88472_BANK_DVBC] =
+		regmap_init_i2c(dev->client[MN88472_BANK_DVBC],
+				&regmap_config);
+	if (IS_ERR(dev->regmap[MN88472_BANK_DVBC])) {
+		ret = PTR_ERR(dev->regmap[MN88472_BANK_DVBC]);
 		goto err_client_1_i2c_unregister_device;
 	}
-	i2c_set_clientdata(dev->client[1], dev);
+	i2c_set_clientdata(dev->client[MN88472_BANK_DVBC], dev);
 
-	dev->client[2] = i2c_new_dummy_device(client->adapter, 0x1c);
-	if (IS_ERR(dev->client[2])) {
-		ret = PTR_ERR(dev->client[2]);
+	dev->client[MN88472_BANK_DVBT2] =
+		i2c_new_dummy_device(client->adapter, MN88472_I2C_ADDR_DVBT2);
+	if (IS_ERR(dev->client[MN88472_BANK_DVBT2])) {
+		ret = PTR_ERR(dev->client[MN88472_BANK_DVBT2]);
 		dev_err(&client->dev, "2nd I2C registration failed\n");
 		goto err_regmap_1_regmap_exit;
 	}
-	dev->regmap[2] = regmap_init_i2c(dev->client[2], &regmap_config);
-	if (IS_ERR(dev->regmap[2])) {
-		ret = PTR_ERR(dev->regmap[2]);
+	dev->regmap[MN88472_BANK_DVBT2] =
+		regmap_init_i2c(dev->client[MN88472_BANK_DVBT2],
+				&regmap_config);
+	if (IS_ERR(dev->regmap[MN88472_BANK_DVBT2])) {
+		ret = PTR_ERR(dev->regmap[MN88472_BANK_DVBT2]);
 		goto err_client_2_i2c_unregister_device;
 	}
-	i2c_set_clientdata(dev->client[2], dev);
+	i2c_set_clientdata(dev->client[MN88472_BANK_DVBT2], dev);
 
 	/* Check demod answers with correct chip id */
-	ret = regmap_read(dev->regmap[2], 0xff, &utmp);
+	ret = regmap_read(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_CHIP_ID, &utmp);
 	if (ret)
 		goto err_regmap_2_regmap_exit;
 
 	dev_dbg(&client->dev, "chip id=%02x\n", utmp);
 
-	if (utmp != 0x02) {
+	if (utmp != MN88472_CHIP_ID) {
 		ret = -ENODEV;
 		goto err_regmap_2_regmap_exit;
 	}
 
 	/* Sleep because chip is active by default */
-	ret = regmap_write(dev->regmap[2], 0x05, 0x3e);
+	ret = regmap_write(dev->regmap[MN88472_BANK_DVBT2], MN88472_REG_POWER_CONTROL,
+			   MN88472_SET_POWER_DOWN);
 	if (ret)
 		goto err_regmap_2_regmap_exit;
 
@@ -977,15 +1057,15 @@ static int mn88472_probe(struct i2c_client *client)
 
 	return 0;
 err_regmap_2_regmap_exit:
-	regmap_exit(dev->regmap[2]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBT2]);
 err_client_2_i2c_unregister_device:
-	i2c_unregister_device(dev->client[2]);
+	i2c_unregister_device(dev->client[MN88472_BANK_DVBT2]);
 err_regmap_1_regmap_exit:
-	regmap_exit(dev->regmap[1]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBC]);
 err_client_1_i2c_unregister_device:
-	i2c_unregister_device(dev->client[1]);
+	i2c_unregister_device(dev->client[MN88472_BANK_DVBC]);
 err_regmap_0_regmap_exit:
-	regmap_exit(dev->regmap[0]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBT]);
 err_kfree:
 	kfree(dev);
 err:
@@ -999,13 +1079,13 @@ static void mn88472_remove(struct i2c_client *client)
 
 	dev_dbg(&client->dev, "\n");
 
-	regmap_exit(dev->regmap[2]);
-	i2c_unregister_device(dev->client[2]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBT2]);
+	i2c_unregister_device(dev->client[MN88472_BANK_DVBT2]);
 
-	regmap_exit(dev->regmap[1]);
-	i2c_unregister_device(dev->client[1]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBC]);
+	i2c_unregister_device(dev->client[MN88472_BANK_DVBC]);
 
-	regmap_exit(dev->regmap[0]);
+	regmap_exit(dev->regmap[MN88472_BANK_DVBT]);
 
 	i2c_set_clientdata(client, NULL);
 	kref_put(&dev->refcount, mn88472_free);
