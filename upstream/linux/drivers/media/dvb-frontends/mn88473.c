@@ -6,9 +6,10 @@
  */
 
 #include "mn88473_priv.h"
+#include "mn88473_init.h"
 #include <linux/delay.h>
 
-#define MN88473_VERSION "1.0.1"
+#define MN88473_VERSION "1.0.3"
 
 static int mn88473_get_tune_settings(struct dvb_frontend *fe,
 				     struct dvb_frontend_tune_settings *s)
@@ -468,6 +469,55 @@ err:
 	return ret;
 }
 
+static int mn88473_write_defaults(struct mn88473_dev *dev)
+{
+	const struct mn88473_reg_val *entry;
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(mn88473_init_regs); i++) {
+		entry = &mn88473_init_regs[i];
+		ret = regmap_write(dev->regmap[entry->bank], entry->reg,
+				   entry->val);
+		if (ret) {
+			dev_warn(&dev->client[0]->dev,
+				 "startup defaults failed at index %u bank %u reg 0x%02x: %d\n",
+				 i, entry->bank, entry->reg, ret);
+			return ret;
+		}
+		if ((i + 1) % 200 == 0)
+			usleep_range(1000, 2000);
+	}
+
+	return 0;
+}
+
+static int mn88473_finish_startup(struct mn88473_dev *dev)
+{
+	unsigned int value;
+	int ret, clear_ret;
+
+	/* The vendor SDK identifies this PLPID write/read/restore as an I2C
+	 * communication test, not a demodulator reset. Windows performs it
+	 * after firmware loading. Restore even after a reported I/O failure.
+	 */
+	ret = regmap_write(dev->regmap[2], 0x36, 0x99);
+	if (!ret)
+		ret = regmap_read(dev->regmap[2], 0x36, &value);
+	clear_ret = regmap_write(dev->regmap[2], 0x36, 0x00);
+	if (clear_ret) {
+		dev_warn(&dev->client[0]->dev,
+			 "startup register 0x36 cleanup failed: %d\n", clear_ret);
+		if (!ret)
+			ret = clear_ret;
+	}
+	if (ret)
+		dev_warn(&dev->client[0]->dev,
+			 "startup register 0x36 sequence failed: %d\n", ret);
+
+	return ret;
+}
+
 static int mn88473_init(struct dvb_frontend *fe)
 {
 	struct i2c_client *client = fe->demodulator_priv;
@@ -488,13 +538,28 @@ static int mn88473_init(struct dvb_frontend *fe)
 	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 
-	/* Check if firmware is already running */
-	ret = regmap_read(dev->regmap[0], 0xf5, &uitmp);
+	/* Only reuse firmware after a complete startup in this attachment.
+	 * A fresh attachment must reset defaults even if firmware was retained.
+	 */
+	if (dev->initialized) {
+		ret = regmap_read(dev->regmap[0], 0xf5, &uitmp);
+		if (ret)
+			goto err;
+		if (!(uitmp & 0x01)) {
+			ret = regmap_read(dev->regmap[0], 0xf8, &uitmp);
+			if (ret)
+				goto err;
+			if (!(uitmp & 0x10))
+				goto warm;
+			dev_warn(&client->dev,
+				 "running firmware parity check failed, reloading\n");
+		}
+	}
+
+	dev->initialized = false;
+	ret = mn88473_write_defaults(dev);
 	if (ret)
 		goto err;
-
-	if (!(uitmp & 0x01))
-		goto warm;
 
 	/* Request the firmware, this will block and timeout */
 	ret = request_firmware(&fw, name, &client->dev);
@@ -562,6 +627,9 @@ static int mn88473_init(struct dvb_frontend *fe)
 	if (ret)
 		goto err_release_firmware;
 	release_firmware(fw);
+	ret = mn88473_finish_startup(dev);
+	if (ret)
+		goto err;
 warm:
 	/* TS config */
 	ret = regmap_write(dev->regmap[2], 0x09, 0x08);
@@ -571,6 +639,7 @@ warm:
 	if (ret)
 		goto err;
 
+	dev->initialized = true;
 	dev->active = true;
 
 	/* init stats here to indicate which stats are supported */
@@ -591,6 +660,7 @@ warm:
 err_release_firmware:
 	release_firmware(fw);
 err:
+	dev->initialized = false;
 	dev_dbg(&client->dev, "failed=%d\n", ret);
 	return ret;
 }

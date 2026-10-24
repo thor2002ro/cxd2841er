@@ -23,6 +23,7 @@ struct mn88473_dev {
 	struct dvb_frontend frontend;
 	u16 i2c_wr_max;
 	bool active;
+	bool initialized;
 	u32 clk;
 };
 

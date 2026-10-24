@@ -14,7 +14,7 @@ All eleven custom modules expose a version through their module metadata:
 | `cxd2841er` | 1.1.11 |
 | `r820t` | 1.0.3 |
 | `mn88472` | 1.0.1 |
-| `mn88473` | 1.0.1 |
+| `mn88473` | 1.0.3 |
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
@@ -92,7 +92,7 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
   removal. Its `stats_mask` uses the same bits and strength-plus-CNR default as
   the Sony module.
 
-### `mn88473` 1.0.1
+### `mn88473` 1.0.3
 
 - Included in the build, version checks, installation and removal alongside
   MN88472; requires `CONFIG_DVB_MN88473=m` in the target kernel configuration.
@@ -106,6 +106,17 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 
 - Logs the upload attempt, failing byte offset and error; validates firmware size
   and transfer limits, and clears active/statistics state before initialization.
+
+- Applies all 573 vendor startup-default writes in their original order on
+  first initialization after attachment, even if firmware survived a reboot.
+  Firmware is then reloaded, followed by `0x1c:0x36 = 0x99`, a read, and a
+  write of `0x00`. Each operation is checked; cleanup attempts the final zero
+  even when the preceding write or read fails.
+
+- Checks parity before reusing firmware on a later initialization in the same
+  attachment. Valid firmware is reused without replaying defaults or the
+  `0x36` sequence. Failed initialization or corrupt firmware forces the full
+  startup path on the next attempt.
 
 - Clears old lock and statistics on status-read errors and starts each status
   query unlocked, including inactive and early acquisition states.
