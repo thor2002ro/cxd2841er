@@ -17,6 +17,16 @@
 
 #define MN88473_FIRMWARE "dvb-demod-mn88473-01.fw"
 
+/* Shared statistics mask assignments with CXD2841ER and MN88472. */
+#define MN88473_STATS_STRENGTH	0x01
+#define MN88473_STATS_CNR	0x02
+#define MN88473_STATS_BLOCKS	0x04
+#define MN88473_STATS_BITS	0x08
+/* Reserved: this driver does not expose detected DVB-C QAM. */
+#define MN88473_STATS_QAM	0x10
+#define MN88473_STATS_ALL	0x1f
+
+
 struct mn88473_dev {
 	struct i2c_client *client[3];
 	struct regmap *regmap[3];

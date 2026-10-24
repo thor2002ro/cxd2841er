@@ -14,7 +14,7 @@ All eleven custom modules expose a version through their module metadata:
 | `cxd2841er` | 1.1.11 |
 | `r820t` | 1.0.3 |
 | `mn88472` | 1.0.1 |
-| `mn88473` | 1.0.4 |
+| `mn88473` | 1.0.5 |
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
@@ -92,10 +92,17 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
   removal. Its `stats_mask` uses the same bits and strength-plus-CNR default as
   the Sony module.
 
-### `mn88473` 1.0.4
+### `mn88473` 1.0.5
 
 - Included in the build, version checks, installation and removal alongside
   MN88472; requires `CONFIG_DVB_MN88473=m` in the target kernel configuration.
+
+- Exposes writable `stats_mask` with the same bit assignments as Sony and
+  MN88472. Status is always read. The default `3` enables strength (`1`) and
+  C/N (`2`); block counters (`4`) and bit counters (`8`, DVB-T/C only) are
+  opt-in. Bit `16` is reserved for detected QAM, which is unsupported here.
+  `0` reads status only and `31` enables every implemented statistics group.
+  Disabled groups perform no measurement reads and report unavailable values.
 
 - Selects Astrometa's final serial variable-clock TS recipe during init and
   every tune: clears `TSSET2[3]`, writes `TSSET1=0x1d`, `CLKSET1=0x03` and

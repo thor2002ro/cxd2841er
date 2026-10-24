@@ -8,8 +8,17 @@
 #include "mn88473_priv.h"
 #include "mn88473_init.h"
 #include <linux/delay.h>
+#include <linux/module.h>
 
-#define MN88473_VERSION "1.0.4"
+#define MN88473_VERSION "1.0.5"
+
+/* Status is always read; match the other frontends' low-overhead default. */
+static unsigned int mn88473_stats_mask = MN88473_STATS_STRENGTH |
+					 MN88473_STATS_CNR;
+module_param_named(stats_mask, mn88473_stats_mask, uint, 0644);
+MODULE_PARM_DESC(stats_mask,
+	"DVB statistics bitmask; status is always read: 0=status only; optional bits: 1=strength, 2=CNR, 4=block errors, 8=bit errors (DVB-T/C only), 16=detected DVB-C QAM (unsupported); 31=all implemented; default=3 (strength+CNR)");
+
 
 static int mn88473_configure_ts(struct mn88473_dev *dev)
 {
@@ -273,6 +282,7 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret, i, stmp;
 	unsigned int utmp, utmp1, utmp2;
+	unsigned int stats_mask = mn88473_stats_mask;
 	u8 buf[5];
 
 	*status = 0;
@@ -343,7 +353,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	}
 
 	/* Signal strength */
-	if (*status & FE_HAS_SIGNAL) {
+	if ((stats_mask & MN88473_STATS_STRENGTH) &&
+	    (*status & FE_HAS_SIGNAL)) {
 		for (i = 0; i < 2; i++) {
 			ret = regmap_bulk_read(dev->regmap[2], 0x86 + i,
 					       &buf[i], 1);
@@ -362,7 +373,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	}
 
 	/* CNR */
-	if (*status & FE_HAS_VITERBI && c->delivery_system == SYS_DVBT) {
+	if ((stats_mask & MN88473_STATS_CNR) &&
+	    (*status & FE_HAS_VITERBI) && c->delivery_system == SYS_DVBT) {
 		/* DVB-T CNR */
 		ret = regmap_bulk_read(dev->regmap[0], 0x8f, buf, 2);
 		if (ret)
@@ -381,7 +393,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
 		c->cnr.stat[0].svalue = stmp;
 		c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-	} else if (*status & FE_HAS_VITERBI &&
+	} else if ((stats_mask & MN88473_STATS_CNR) &&
+		   (*status & FE_HAS_VITERBI) &&
 		   c->delivery_system == SYS_DVBT2) {
 		/* DVB-T2 CNR */
 		for (i = 0; i < 3; i++) {
@@ -415,7 +428,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
 		c->cnr.stat[0].svalue = stmp;
 		c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-	} else if (*status & FE_HAS_VITERBI &&
+	} else if ((stats_mask & MN88473_STATS_CNR) &&
+		   (*status & FE_HAS_VITERBI) &&
 		   c->delivery_system == SYS_DVBC_ANNEX_A) {
 		/* DVB-C CNR */
 		ret = regmap_bulk_read(dev->regmap[1], 0xa1, buf, 4);
@@ -442,8 +456,9 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	}
 
 	/* BER */
-	if (*status & FE_HAS_LOCK && (c->delivery_system == SYS_DVBT ||
-				      c->delivery_system == SYS_DVBC_ANNEX_A)) {
+	if ((stats_mask & MN88473_STATS_BITS) && (*status & FE_HAS_LOCK) &&
+	    (c->delivery_system == SYS_DVBT ||
+	     c->delivery_system == SYS_DVBC_ANNEX_A)) {
 		/* DVB-T & DVB-C BER */
 		ret = regmap_bulk_read(dev->regmap[0], 0x92, buf, 5);
 		if (ret)
@@ -465,7 +480,7 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	}
 
 	/* PER */
-	if (*status & FE_HAS_LOCK) {
+	if ((stats_mask & MN88473_STATS_BLOCKS) && (*status & FE_HAS_LOCK)) {
 		ret = regmap_bulk_read(dev->regmap[0], 0xdd, buf, 4);
 		if (ret)
 			goto err;
