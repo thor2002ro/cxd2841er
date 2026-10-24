@@ -10,6 +10,7 @@
 #include <linux/module.h>
 
 #include "mn88472_priv.h"
+#include "mn8847x_cnr.h"
 
 /*
  * Use the same bits as CXD2841ER so one sysfs setting works for both
@@ -145,9 +146,8 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		if (utmp) {
 			/* CNR[dB]: 10 * log10(65536 / value) + 2 */
 			/* log10(65536) = 80807124, 0.2 = 3355443 */
-			stmp = ((u64)MN88472_LOG10_65536_Q24 - intlog10(utmp)
-			       + MN88472_CNR_OFFSET_0_2_Q24)
-			       * MN88472_CNR_MILLIDB_SCALE >> MN88472_LOG_FRACTION_BITS;
+			stmp = mn8847x_cnr_millidb((s64)MN88472_LOG10_65536_Q24 -
+						 intlog10(utmp) + MN88472_CNR_OFFSET_0_2_Q24);
 
 			dev_dbg(&client->dev, "cnr=%d value=%u\n", stmp, utmp);
 		} else {
@@ -174,17 +174,15 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 			if (utmp1) {
 				/* CNR[dB]: 10 * log10(16384 / value) - 6 */
 				/* log10(16384) = 70706234, 0.6 = 10066330 */
-				stmp = ((u64)MN88472_LOG10_16384_Q24 - intlog10(utmp)
-				       - MN88472_CNR_OFFSET_0_6_Q24) * MN88472_CNR_MILLIDB_SCALE
-				       >> MN88472_LOG_FRACTION_BITS;
+				stmp = mn8847x_cnr_millidb((s64)MN88472_LOG10_16384_Q24 -
+							 intlog10(utmp) - MN88472_CNR_OFFSET_0_6_Q24);
 				dev_dbg(&client->dev, "cnr=%d value=%u MISO\n",
 					stmp, utmp);
 			} else {
 				/* CNR[dB]: 10 * log10(65536 / value) + 2 */
 				/* log10(65536) = 80807124, 0.2 = 3355443 */
-				stmp = ((u64)MN88472_LOG10_65536_Q24 - intlog10(utmp)
-				       + MN88472_CNR_OFFSET_0_2_Q24) * MN88472_CNR_MILLIDB_SCALE
-				       >> MN88472_LOG_FRACTION_BITS;
+				stmp = mn8847x_cnr_millidb((s64)MN88472_LOG10_65536_Q24 -
+							 intlog10(utmp) + MN88472_CNR_OFFSET_0_2_Q24);
 
 				dev_dbg(&client->dev, "cnr=%d value=%u SISO\n",
 					stmp, utmp);
@@ -211,9 +209,8 @@ static int mn88472_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		if (utmp1 && utmp2) {
 			/* CNR[dB]: 10 * log10(8 * (signal / noise)) */
 			/* log10(8) = 15151336 */
-			stmp = ((u64)MN88472_LOG10_8_Q24 + intlog10(utmp1)
-			       - intlog10(utmp2)) * MN88472_CNR_MILLIDB_SCALE
-			       >> MN88472_LOG_FRACTION_BITS;
+			stmp = mn8847x_cnr_millidb((s64)MN88472_LOG10_8_Q24 +
+						 intlog10(utmp1) - intlog10(utmp2));
 
 			dev_dbg(&client->dev, "cnr=%d signal=%u noise=%u\n",
 				stmp, utmp1, utmp2);
@@ -1133,7 +1130,7 @@ static struct i2c_driver mn88472_driver = {
 
 module_i2c_driver(mn88472_driver);
 
-MODULE_VERSION("1.0.1");
+MODULE_VERSION("1.0.2");
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("Panasonic MN88472 DVB-T/T2/C demodulator driver");
 MODULE_LICENSE("GPL");

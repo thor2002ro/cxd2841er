@@ -13,8 +13,8 @@ All eleven custom modules expose a version through their module metadata:
 | --- | --- |
 | `cxd2841er` | 1.1.11 |
 | `r820t` | 1.0.3 |
-| `mn88472` | 1.0.1 |
-| `mn88473` | 1.0.5 |
+| `mn88472` | 1.0.2 |
+| `mn88473` | 1.0.6 |
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
@@ -73,7 +73,10 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
 - Releases shared tuner state when attachment fails and reports AGC as an
   uncalibrated relative strength rather than an invented dBm value.
 
-### `mn88472` 1.0.1
+### `mn88472` 1.0.2
+
+- Uses signed CNR arithmetic and clamps nonpositive results to zero before
+  scaling to millidecibels, preserving fractional precision for positive values.
 
 - Writes firmware through the fixed program-data port, validates configuration
   and transfer limits, identifies parity failures, and clears active/statistics
@@ -92,7 +95,20 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
   removal. Its `stats_mask` uses the same bits and strength-plus-CNR default as
   the Sony module.
 
-### `mn88473` 1.0.5
+### `mn88473` 1.0.6
+
+- Selects ID lookup for every explicit DVB-T2 PLP ID, including zero, and index
+  lookup for automatic selection. Rejects IDs above 255, except the automatic
+  sentinel, before tuner or register writes. Mode changes preserve other bits;
+  failed mode/ID writes stop before resetting acquisition.
+- Configures the DVB-T/C BER monitor before reading its counters. Checked masked
+  writes clear BERSET1 bit 5 and select BERRDSET low nibble 5, preserving other
+  bits. Disabled or unlocked BER collection performs no monitor operations.
+- Scales the BER length by `203*8`, matching the native `0x658` multiplier in
+  both Windows builds and the SDK. The earlier audit incorrectly attributed
+  `204*8` to Windows; the fresh decompr/native-instruction check corrects it.
+- Shares the signed, zero-clamped CNR conversion with MN88472; positive results
+  retain millidecibel precision.
 
 - Included in the build, version checks, installation and removal alongside
   MN88472; requires `CONFIG_DVB_MN88473=m` in the target kernel configuration.
@@ -324,6 +340,15 @@ Satellite strength reporting, C/N, BER, UCB and hardware calibration settings
 are unchanged. These correctness changes do not establish an RF sensitivity gain.
 
 ## Build
+
+Run the Panasonic host-driver regression checks with a C compiler and Python:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+They exercise the actual driver function bodies with register mocks. Reception,
+counter lifetime and physical reset behavior still require hardware checks.
 
 Requires only the standard kernel build tree (headers + .config), no full kernel
 source:

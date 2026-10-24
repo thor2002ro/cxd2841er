@@ -7,10 +7,11 @@
 
 #include "mn88473_priv.h"
 #include "mn88473_init.h"
+#include "mn8847x_cnr.h"
 #include <linux/delay.h>
 #include <linux/module.h>
 
-#define MN88473_VERSION "1.0.5"
+#define MN88473_VERSION "1.0.6"
 
 /* Status is always read; match the other frontends' low-overhead default. */
 static unsigned int mn88473_stats_mask = MN88473_STATS_STRENGTH |
@@ -76,6 +77,12 @@ static int mn88473_set_frontend(struct dvb_frontend *fe)
 
 	if (!dev->active) {
 		ret = -EAGAIN;
+		goto err;
+	}
+
+	if (c->delivery_system == SYS_DVBT2 &&
+	    c->stream_id != NO_STREAM_ID_FILTER && c->stream_id > 0xff) {
+		ret = -EINVAL;
 		goto err;
 	}
 
@@ -257,6 +264,11 @@ static int mn88473_set_frontend(struct dvb_frontend *fe)
 
 	/* PLP */
 	if (c->delivery_system == SYS_DVBT2) {
+		/* Bit 7 selects ordinal lookup; explicit ID zero is an ID too. */
+		ret = regmap_update_bits(dev->regmap[2], 0x32, 0x80,
+					c->stream_id == NO_STREAM_ID_FILTER ? 0x80 : 0);
+		if (ret)
+			goto err;
 		ret = regmap_write(dev->regmap[2], 0x36,
 				(c->stream_id == NO_STREAM_ID_FILTER) ? 0 :
 				c->stream_id );
@@ -384,8 +396,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		if (utmp) {
 			/* CNR[dB]: 10 * (log10(65536 / value) + 0.2) */
 			/* log10(65536) = 80807124, 0.2 = 3355443 */
-			stmp = div_u64(((u64)80807124 - intlog10(utmp)
-					+ 3355443) * 10000, 1 << 24);
+			stmp = mn8847x_cnr_millidb((s64)80807124 - intlog10(utmp)
+						 + 3355443);
 			dev_dbg(&client->dev, "cnr=%d value=%u\n", stmp, utmp);
 		} else {
 			stmp = 0;
@@ -410,15 +422,15 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 			if (utmp1) {
 				/* CNR[dB]: 10 * (log10(16384 / value) - 0.6) */
 				/* log10(16384) = 70706234, 0.6 = 10066330 */
-				stmp = div_u64(((u64)70706234 - intlog10(utmp)
-						- 10066330) * 10000, 1 << 24);
+				stmp = mn8847x_cnr_millidb((s64)70706234 - intlog10(utmp)
+							 - 10066330);
 				dev_dbg(&client->dev, "cnr=%d value=%u MISO\n",
 					stmp, utmp);
 			} else {
 				/* CNR[dB]: 10 * (log10(65536 / value) + 0.2) */
 				/* log10(65536) = 80807124, 0.2 = 3355443 */
-				stmp = div_u64(((u64)80807124 - intlog10(utmp)
-						+ 3355443) * 10000, 1 << 24);
+				stmp = mn8847x_cnr_millidb((s64)80807124 - intlog10(utmp)
+							 + 3355443);
 				dev_dbg(&client->dev, "cnr=%d value=%u SISO\n",
 					stmp, utmp);
 			}
@@ -441,8 +453,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		if (utmp1 && utmp2) {
 			/* CNR[dB]: 10 * log10(8 * (signal / noise)) */
 			/* log10(8) = 15151336 */
-			stmp = div_u64(((u64)15151336 + intlog10(utmp1)
-					- intlog10(utmp2)) * 10000, 1 << 24);
+			stmp = mn8847x_cnr_millidb((s64)15151336 + intlog10(utmp1)
+						 - intlog10(utmp2));
 			dev_dbg(&client->dev, "cnr=%d signal=%u noise=%u\n",
 				stmp, utmp1, utmp2);
 		} else {
@@ -460,13 +472,20 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	    (c->delivery_system == SYS_DVBT ||
 	     c->delivery_system == SYS_DVBC_ANNEX_A)) {
 		/* DVB-T & DVB-C BER */
+		ret = regmap_update_bits(dev->regmap[0], 0x5b, 0x20, 0);
+		if (ret)
+			goto err;
+		ret = regmap_update_bits(dev->regmap[0], 0x60, 0x0f, 0x05);
+		if (ret)
+			goto err;
 		ret = regmap_bulk_read(dev->regmap[0], 0x92, buf, 5);
 		if (ret)
 			goto err;
 
 		utmp1 = buf[0] << 16 | buf[1] << 8 | buf[2] << 0;
 		utmp2 = buf[3] << 8 | buf[4] << 0;
-		utmp2 = utmp2 * 8 * 204;
+		/* Windows and the vendor SDK both use 0x658 (203 * 8). */
+		utmp2 = utmp2 * 8 * 203;
 		dev_dbg(&client->dev, "post_bit_error=%u post_bit_count=%u\n",
 			utmp1, utmp2);
 
