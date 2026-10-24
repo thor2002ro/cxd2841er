@@ -355,9 +355,18 @@ source:
 
 ```sh
 make                  # builds all eleven modified modules
+make clean            # removes module build outputs and dvb-check; no headers needed
+make install          # same as ./build.sh install
+make uninstall        # same as ./build.sh uninstall
+make dkms             # register, build, and install through DKMS (uses sudo)
 ./build.sh install    # builds locally, then installs the modified modules (also the default)
 ./build.sh uninstall  # removes the modified modules from updates/, then runs depmod
 ```
+
+`all`, `modules`, and `default` select the same module build. To target a
+different kernel, use `make KERNELRELEASE=<release>`; `KDIR=/path/to/headers`
+overrides the build-tree location. These settings also apply to `make install`
+and `make uninstall`.
 
 `make` detects `CONFIG_CC_IS_CLANG=y` in the kernel build tree and enables
 `LLVM=1` automatically; an explicit `LLVM` setting takes precedence.
@@ -374,6 +383,37 @@ against that exact kernel and architecture. Stop tuner users before manually
 reloading the drivers, or reboot after installation or removal. Uninstall
 removes only these overrides, preserving stock kernel modules and local build
 outputs.
+
+### DKMS
+
+Install DKMS, a kernel-compatible compiler/toolchain, and the matching kernel
+headers first, then run:
+
+```sh
+make dkms
+```
+
+This copies the module sources into `/usr/src/linux-dvb-drivers-fixes-1.0.0`, registers
+the package if needed, and asks DKMS to build and install it. It uses `sudo`
+for system changes. Run the same command after editing the drivers to refresh
+the sources and rebuild the selected kernel's modules. Use
+`make dkms KERNELRELEASE=<release>` to select another installed kernel;
+`KDIR=/path/to/headers` also works.
+
+DKMS handles automatic rebuilds for later kernel updates. The same driver
+configuration requirements, built-in DVB-core exception, and automatic LLVM
+detection apply. Reload the drivers or reboot to use the installed modules.
+
+Use either manual installation or DKMS for a kernel. If switching an existing
+manual installation to DKMS, first run `make uninstall` for that kernel to
+remove the manual copies from `updates/`. The DKMS package version in
+`dkms.conf` is separate from the individual driver versions; the target forces
+rebuild and installation of the complete module set. To remove this DKMS
+package from all kernels:
+
+```sh
+sudo dkms remove -m linux-dvb-drivers-fixes -v 1.0.0 --all
+```
 
 ## Verify
 
