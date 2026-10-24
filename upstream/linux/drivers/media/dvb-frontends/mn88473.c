@@ -9,7 +9,38 @@
 #include "mn88473_init.h"
 #include <linux/delay.h>
 
-#define MN88473_VERSION "1.0.3"
+#define MN88473_VERSION "1.0.4"
+
+static int mn88473_configure_ts(struct mn88473_dev *dev)
+{
+	unsigned int value;
+	int ret;
+
+	/* Astrometa Windows init and tune select serial variable-clock TS.
+	 * Override the common table's fixed-clock defaults as one recipe.
+	 */
+	ret = regmap_read(dev->regmap[2], 0x09, &value);
+	if (ret)
+		goto err;
+	ret = regmap_write(dev->regmap[2], 0x09, value & ~0x08);
+	if (ret)
+		goto err;
+	ret = regmap_write(dev->regmap[2], 0x08, 0x1d);
+	if (ret)
+		goto err;
+	ret = regmap_write(dev->regmap[0], 0xb2, 0x03);
+	if (ret)
+		goto err;
+	ret = regmap_write(dev->regmap[0], 0xd7, 0x05);
+	if (ret)
+		goto err;
+
+	return 0;
+err:
+	dev_warn(&dev->client[0]->dev,
+		 "serial variable-clock TS configuration failed: %d\n", ret);
+	return ret;
+}
 
 static int mn88473_get_tune_settings(struct dvb_frontend *fe,
 				     struct dvb_frontend_tune_settings *s)
@@ -211,10 +242,7 @@ static int mn88473_set_frontend(struct dvb_frontend *fe)
 	ret = regmap_write(dev->regmap[1], 0xbe, 0x08);
 	if (ret)
 		goto err;
-	ret = regmap_write(dev->regmap[0], 0xb2, 0x37);
-	if (ret)
-		goto err;
-	ret = regmap_write(dev->regmap[0], 0xd7, 0x04);
+	ret = mn88473_configure_ts(dev);
 	if (ret)
 		goto err;
 
@@ -631,11 +659,7 @@ static int mn88473_init(struct dvb_frontend *fe)
 	if (ret)
 		goto err;
 warm:
-	/* TS config */
-	ret = regmap_write(dev->regmap[2], 0x09, 0x08);
-	if (ret)
-		goto err;
-	ret = regmap_write(dev->regmap[2], 0x08, 0x1d);
+	ret = mn88473_configure_ts(dev);
 	if (ret)
 		goto err;
 
