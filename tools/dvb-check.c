@@ -20,6 +20,7 @@
 #include <sys/ioctl.h>
 #include <sys/klog.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
@@ -32,9 +33,12 @@
 #ifndef DEV_ROOT
 #define DEV_ROOT "/dev"
 #endif
-#define VERSION "1.2.5"
+#define VERSION "1.4.0"
 
 static volatile sig_atomic_t stopping;
+static volatile sig_atomic_t read_expired;
+static double read_timeout = 0.25;
+static bool specialized;
 static int collection_errors;
 static bool usbmon_loaded, debugfs_mounted;
 static const unsigned parameter_cmds[] = {
@@ -61,9 +65,74 @@ struct frontend {
 	int fd;
 	int open_error;
 	bool previous_valid;
+	bool profile_checked;
+	const char *module;
 	uint32_t parameters[ARRAY_SIZE(parameter_cmds)];
 	struct dtv_fe_stats post_error, post_total;
 };
+
+/* O_NONBLOCK does not bound the DVB core's interruptible MFE open wait,
+ * nor its frontend semaphore. Interrupt those waits without taking ownership
+ * of the tuner. Uninterruptible driver I/O still depends on the driver.
+ */
+static void read_timeout_signal(int signal_number)
+{
+	(void)signal_number;
+	read_expired = 1;
+}
+
+static void read_timer(bool start)
+{
+	struct itimerval timer = {0};
+	if (start) {
+		read_expired = 0;
+		timer.it_value.tv_sec = (time_t)read_timeout;
+		timer.it_value.tv_usec = (suseconds_t)((read_timeout - (time_t)read_timeout) * 1e6);
+		/* Cover a deadline signal delivered between the flag check and
+		 * entry into an interruptible syscall. Disarm before rendering.
+		 */
+		timer.it_interval.tv_usec = 10000;
+	}
+	if (setitimer(ITIMER_REAL, &timer, NULL) < 0) {
+		perror("frontend read timer");
+		exit(1);
+	}
+}
+
+static int frontend_ioctl(int fd, unsigned long command, void *argument)
+{
+	if (read_expired || stopping) {
+		errno = read_expired ? ETIMEDOUT : EINTR;
+		return -1;
+	}
+	int result = ioctl(fd, command, argument);
+	if (result < 0 && errno == EINTR && read_expired) errno = ETIMEDOUT;
+	return result;
+}
+
+static int frontend_open(const char *path)
+{
+	if (read_expired || stopping) {
+		errno = read_expired ? ETIMEDOUT : EINTR;
+		return -1;
+	}
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0 && errno == EINTR && read_expired) errno = ETIMEDOUT;
+	return fd;
+}
+
+static bool temporary_error(int error)
+{
+	return error == EBUSY || error == EAGAIN || error == ETIMEDOUT;
+}
+
+static bool unsupported_error(int error)
+{
+	/* DVB core can return the kernel-only ENOTSUPP (524) unchanged when
+	 * a legacy callback is absent. libc only defines EOPNOTSUPP.
+	 */
+	return error == EINVAL || error == EOPNOTSUPP || error == ENOTTY || error == ENOSYS || error == 524;
+}
 
 static void interrupted(int signal_number)
 {
@@ -101,6 +170,75 @@ static bool attribute(const char *directory, const char *name, char *value, size
 	value[length] = 0;
 	clean_text(value);
 	return success;
+}
+
+static bool module_unsigned(const char *module, const char *parameter, unsigned *value)
+{
+	if (!module) return false;
+	char *directory = path_format(SYS_ROOT "/module/%s/parameters", module);
+	char text[64], *end;
+	bool found = attribute(directory, parameter, text, sizeof(text));
+	free(directory);
+	if (!found || !isdigit((unsigned char)*text)) return false;
+	errno = 0;
+	unsigned long parsed = strtoul(text, &end, 0);
+	if (errno || *end || parsed > UINT_MAX) return false;
+	*value = (unsigned)parsed;
+	return true;
+}
+
+static const char *frontend_module(const char *name)
+{
+	/* Identify the demodulator from its own reported name, never from a
+	 * globally loaded module or an assumed USB/tuner pairing.
+	 */
+	const struct { const char *prefix, *module; } profiles[] = {
+		{ "Panasonic MN88472", "mn88472" },
+		{ "Panasonic MN88473", "mn88473" },
+		{ "Realtek RTL2832 (DVB-T)", "rtl2832" },
+		{ "Sony CXD2837ER ", "cxd2841er" },
+		{ "Sony CXD2838ER ", "cxd2841er" },
+		{ "Sony CXD2841ER ", "cxd2841er" },
+		{ "Sony CXD2843ER ", "cxd2841er" },
+		{ "Sony CXD2854ER ", "cxd2841er" },
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(profiles); i++) {
+		size_t length = strlen(profiles[i].prefix);
+		if (!strncmp(name, profiles[i].prefix, length) &&
+		    (profiles[i].prefix[length - 1] == ' ' || !name[length] || name[length] == ' '))
+			return profiles[i].module;
+	}
+	return NULL;
+}
+
+static bool family(const struct frontend *f, const char *module)
+{
+	return f->module && !strcmp(f->module, module);
+}
+
+static void profile_information(const struct frontend *f)
+{
+	if (!specialized) return;
+	printf("    specialized_profile=%s (kernel-reported frontend name; repository driver rules)\n",
+	       f->module ? f->module : "no chip-specific profile");
+	if (family(f, "cxd2841er")) {
+		puts("    Sony: terrestrial/cable/ISDB strength is relative AGC; most locked statistics use a one-second cache.\n"
+		     "    Detected DVB-C QAM needs stats_mask bit 16; other modulation readback may be a tuning request.\n"
+		     "    TS-enable verification and register/gate failures require --kernel-log; lock alone does not prove TS delivery.");
+	} else if (family(f, "mn88472")) {
+		puts("    MN88472: bit counters unsupported; stats_mask bit 8 cannot enable BER.\n"
+		     "    Strength is relative AGC; block counters are driver-accumulated, hardware sample lifetime unverified.\n"
+		     "    Firmware-running/parity and wake/standby failures require --kernel-log; no live register probing.");
+	} else if (family(f, "mn88473")) {
+		puts("    MN88473: DVB-T/C BER supported; DVB-T2 BER unsupported in the repository driver.\n"
+		     "    Decoded modulation/FEC/guard readback is not implemented; tune properties may be cached requests.\n"
+		     "    Strength is relative AGC; accumulated BER/block counters have hardware sample lifetime unverified.\n"
+		     "    Firmware/startup/TS state is not exposed by DVB: use --kernel-log for upload attempt/offset, parity,\n"
+		     "    startup defaults, register 0x36 and serial variable-clock TS errors; compare cold and warm boots.");
+	} else if (family(f, "rtl2832")) {
+		puts("    RTL2832: DVB-T demodulator; block/UCB counters are not implemented by the repository driver.\n"
+		     "    A sibling MN8847x frontend may share the physical RF tuner; use the active frontend.");
+	}
 }
 
 static void print_attribute(const char *directory, const char *name)
@@ -357,7 +495,7 @@ static int property_error(const struct dtv_property *p)
 static void get_properties(int fd, struct dtv_property *props, unsigned count, int *errors)
 {
 	struct dtv_properties request = { .num = count, .props = props };
-	if (ioctl(fd, FE_GET_PROPERTY, &request) == 0) {
+	if (frontend_ioctl(fd, FE_GET_PROPERTY, &request) == 0) {
 		for (unsigned i = 0; i < count; i++) errors[i] = property_error(&props[i]);
 		return;
 	}
@@ -365,19 +503,20 @@ static void get_properties(int fd, struct dtv_property *props, unsigned count, i
 	for (unsigned i = 0; i < count; i++) {
 		errors[i] = error;
 		/* Older drivers may reject one unsupported property in a batch. */
-		if (error == EINVAL || error == EOPNOTSUPP || error == ENOTTY) {
+		if (unsupported_error(error)) {
 			unsigned command = props[i].cmd;
 			memset(&props[i], 0, sizeof(props[i]));
 			props[i].cmd = command;
 			struct dtv_properties single = { .num = 1, .props = &props[i] };
-			errors[i] = ioctl(fd, FE_GET_PROPERTY, &single) < 0 ? errno : property_error(&props[i]);
+			errors[i] = frontend_ioctl(fd, FE_GET_PROPERTY, &single) < 0 ? errno : property_error(&props[i]);
 		}
 	}
 }
 
 static void record_error(int error, bool optional)
 {
-	if (!optional || (error != EINVAL && error != EOPNOTSUPP && error != ENOTTY && error != ENOSYS))
+	if (stopping && error == EINTR) return;
+	if (!temporary_error(error) && (!optional || !unsupported_error(error)))
 		collection_errors++;
 }
 
@@ -454,31 +593,39 @@ static void inventory(struct frontend *f)
 	char *node = path_format(DEV_ROOT "/dvb/adapter%u/frontend%u", f->adapter, f->number);
 	printf("\nDEVICE %s\n", node);
 	hardware_information(f->adapter, f->number);
-	f->fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	read_timer(true);
+	f->fd = frontend_open(node);
 	free(node);
 	if (f->fd < 0) {
 		f->open_error = errno;
-		if (errno == EBUSY) puts("    frontend busy (shared tuner in use; skipped)");
-		else unavailable("open frontend read-only", errno, false);
+		read_timer(false);
+		if (f->open_error == EBUSY) puts("    frontend busy (shared tuner in use; skipped)");
+		else unavailable("open frontend read-only", f->open_error, false);
 		return;
 	}
 	struct dvb_frontend_info info = {0};
-	if (ioctl(f->fd, FE_GET_INFO, &info) < 0) {
-		f->open_error = errno;
-		unavailable("FE_GET_INFO", errno, false);
+	if (frontend_ioctl(f->fd, FE_GET_INFO, &info) < 0) {
+		int error = errno;
+		read_timer(false);
 		close(f->fd); f->fd = -1;
+		unavailable("FE_GET_INFO", error, false);
 		return;
 	}
+	struct dtv_property props[2] = { { .cmd = DTV_API_VERSION }, { .cmd = DTV_ENUM_DELSYS } };
+	int errors[2];
+	get_properties(f->fd, props, 2, errors);
+	read_timer(false);
+	close(f->fd); f->fd = -1;
 	info.name[sizeof(info.name) - 1] = 0;
 	clean_text(info.name);
+	f->module = frontend_module(info.name);
+	f->profile_checked = true;
 	printf("    frontend_name=%s\n    capabilities=0x%08x legacy_type=%u\n", info.name, info.caps, info.type);
+	profile_information(f);
 	print_capabilities(info.caps);
 	printf("    frequency_range=%u..%u %s step=%u tolerance=%u\n", info.frequency_min, info.frequency_max,
 	       info.type == FE_QPSK ? "kHz" : "Hz", info.frequency_stepsize, info.frequency_tolerance);
 	printf("    symbol_rate_range=%u..%u baud\n", info.symbol_rate_min, info.symbol_rate_max);
-	struct dtv_property props[2] = { { .cmd = DTV_API_VERSION }, { .cmd = DTV_ENUM_DELSYS } };
-	int errors[2];
-	get_properties(f->fd, props, 2, errors);
 	if (errors[0]) unavailable("DVB API", errors[0], true);
 	else printf("    DVB API=%u.%u\n", props[0].u.data >> 8, props[0].u.data & 255);
 	if (errors[1]) unavailable("delivery systems", errors[1], true);
@@ -490,12 +637,12 @@ static void inventory(struct frontend *f)
 			printf(" %s(%u)", delivery_name(props[1].u.buffer.data[i]), props[1].u.buffer.data[i]);
 		puts("");
 	}
-	close(f->fd); f->fd = -1;
 }
 
 static void module_information(void)
 {
 	puts("\nLoaded DVB module metadata (global; does not prove a particular chip is attached):");
+	if (specialized) puts("  Module settings below are global, not a per-frontend tuner identification; no settings are changed.");
 	glob_t modules = {0};
 	if (!glob(SYS_ROOT "/module/*", 0, NULL, &modules)) {
 		for (size_t i = 0; i < modules.gl_pathc; i++) {
@@ -511,6 +658,34 @@ static void module_information(void)
 			char value[64];
 			if (attribute(modules.gl_pathv[i], "parameters/no_imr_cal", value, sizeof(value)))
 				printf("    no_imr_cal=%s\n", value);
+			if (!specialized) continue;
+			if (!strcmp(name, "cxd2841er") || !strcmp(name, "mn88472") || !strcmp(name, "mn88473")) {
+				unsigned mask;
+				if (module_unsigned(name, "stats_mask", &mask)) {
+					printf("    stats_mask=%u: strength=%s CNR=%s blocks=%s bits=%s QAM=%s (repository bit assignments)\n",
+					       mask, mask & 1 ? "on" : "off", mask & 2 ? "on" : "off", mask & 4 ? "on" : "off",
+					       mask & 8 ? "on" : "off", mask & 16 ? "on" : "off");
+					if (!strcmp(name, "mn88472")) puts("    Bit 8 is reserved: bit counters unsupported in the repository driver.");
+					if (!strcmp(name, "mn88473")) puts("    Bit 8 only implements DVB-T/C BER; bit 16 is reserved (detected QAM unsupported).");
+					if (mask & ~31u) printf("    Unrecognized stats_mask bits=0x%x; no meaning inferred.\n", mask & ~31u);
+				} else puts("    stats_mask unavailable (not exposed, unreadable or invalid); no default assumed.");
+			}
+			const char *const parameters[] = { "debug", "dvb_mfe_wait_time", "dvb_shutdown_timeout", "nb_packet_buffer_size" };
+			for (size_t p = 0; p < ARRAY_SIZE(parameters); p++) {
+				char *parameter = path_format("parameters/%s", parameters[p]);
+				if (attribute(modules.gl_pathv[i], parameter, value, sizeof(value))) printf("    %s=%s\n", parameters[p], value);
+				free(parameter);
+			}
+			if (!strcmp(name, "r820t")) {
+				unsigned disabled;
+				if (module_unsigned(name, "no_imr_cal", &disabled))
+					printf("    IMR calibration %s at module init; current calibration/PLL state needs kernel logs.\n", disabled ? "disabled" : "enabled");
+				puts("    RF tuner PLL/calibration and demodulator lock are separate; relative AGC is not dBm.");
+			} else if (!strcmp(name, "tda18250")) {
+				puts("    TDA18250: power/charge-pump/standby failures require kernel logs; live PLL/standby state is not exposed by DVB.");
+			} else if (!strcmp(name, "dvb_usb_dib0700")) {
+				puts("    DiB0700: check kernel logs for short control/I2C transfers and bulk overflow/recovery; demodulator lock does not prove USB TS delivery.");
+			}
 		}
 	}
 	globfree(&modules);
@@ -523,6 +698,31 @@ static int validate_stat(const struct dtv_property *p, int error)
 	for (unsigned i = 0; i < p->u.st.len; i++)
 		if (p->u.st.stat[i].scale > FE_SCALE_COUNTER) return EPROTO;
 	return 0;
+}
+
+static bool missing_stat(const struct dtv_property *p, int error)
+{
+	/* An explicit NOT_AVAILABLE may mean stats_mask disabled the read.
+	 * Do not override it or hide genuine I/O failures with legacy reads.
+	 */
+	return unsupported_error(error) || (!error && !p->u.st.len);
+}
+
+static void legacy_stat(int fd, struct dtv_property *p, int *error,
+		unsigned long command, bool counter)
+{
+	if (!missing_stat(p, *error)) return;
+	uint16_t relative = 0;
+	uint32_t count = 0;
+	if (frontend_ioctl(fd, command, counter ? (void *)&count : (void *)&relative) < 0) {
+		if (!unsupported_error(errno)) *error = errno;
+		return;
+	}
+	memset(&p->u.st, 0, sizeof(p->u.st));
+	p->u.st.len = 1;
+	p->u.st.stat[0].scale = counter ? FE_SCALE_COUNTER : FE_SCALE_RELATIVE;
+	p->u.st.stat[0].uvalue = counter ? count : relative;
+	*error = 0;
 }
 
 static void print_stat(const struct dtv_property *p, unsigned which, int error)
@@ -612,32 +812,112 @@ static void table_error(char *text, size_t size, const char *name, int error, bo
 	if (!*text) snprintf(text, size, "%s: %s (%d)", name, strerror(error), error);
 }
 
-static void sample_frontend(struct frontend *f, bool table)
+static void diagnostic_note(char *text, size_t size, const char *format, ...)
+{
+	size_t used = strlen(text);
+	if (used >= size - 1) return;
+	if (used) {
+		int added = snprintf(text + used, size - used, "; ");
+		if (added < 0 || (size_t)added >= size - used) return;
+		used += (size_t)added;
+	}
+	va_list args;
+	va_start(args, format);
+	vsnprintf(text + used, size - used, format, args);
+	va_end(args);
+}
+
+static bool reported_stat(const struct dtv_property *p, int error)
+{
+	return !error && p->u.st.len && p->u.st.stat[0].scale != FE_SCALE_NOT_AVAILABLE;
+}
+
+static void specialized_diagnosis(const struct frontend *f,
+		const struct dtv_property *parameters, const int *errors,
+		const struct dtv_property *stats, const int *stat_errors,
+		char *text, size_t size)
+{
+	if (!f->module) {
+		diagnostic_note(text, size, "no chip-specific profile");
+		return;
+	}
+	bool mn72 = family(f, "mn88472"), mn73 = family(f, "mn88473");
+	bool system_valid = !errors[0];
+	unsigned system = parameters[0].u.data;
+	bool t2 = system_valid && system == SYS_DVBT2;
+	bool missing_bits = !reported_stat(&stats[4], stat_errors[4]) || !reported_stat(&stats[5], stat_errors[5]);
+	bool pre_bits = reported_stat(&stats[2], stat_errors[2]) && reported_stat(&stats[3], stat_errors[3]) &&
+		stats[2].u.st.stat[0].scale == FE_SCALE_COUNTER && stats[3].u.st.stat[0].scale == FE_SCALE_COUNTER;
+	bool missing_blocks = !reported_stat(&stats[6], stat_errors[6]);
+	unsigned mask;
+	bool mask_valid = module_unsigned(f->module, "stats_mask", &mask);
+	if (!family(f, "rtl2832")) {
+		if (!mask_valid) diagnostic_note(text, size, "stats_mask unavailable");
+		else {
+			if (!(mask & 1) && !reported_stat(&stats[0], stat_errors[0])) diagnostic_note(text, size, "strength disabled by stats_mask");
+			if (!(mask & 2) && !reported_stat(&stats[1], stat_errors[1])) diagnostic_note(text, size, "C/N disabled by stats_mask");
+			if (!(mask & 4) && missing_blocks) diagnostic_note(text, size, "UCB disabled by stats_mask");
+			if (!(mask & 8) && missing_bits && !pre_bits && !mn72 && !(mn73 && (!system_valid || t2)))
+				diagnostic_note(text, size, "BER disabled by stats_mask");
+		}
+	}
+	if (mn72 && missing_bits) diagnostic_note(text, size, "MN88472 bit counters unsupported");
+	if (mn73 && t2 && missing_bits) diagnostic_note(text, size, "MN88473 DVB-T2 BER unsupported");
+	if (family(f, "rtl2832") && missing_blocks) diagnostic_note(text, size, "RTL2832 UCB unsupported");
+	if (family(f, "cxd2841er") && pre_bits && missing_bits)
+		diagnostic_note(text, size, "pre-FEC counters available; postBER not exposed");
+	if (t2 && !errors[6]) {
+		unsigned plp = parameters[6].u.data;
+		if (plp == UINT32_MAX || (!mn73 && plp > 255)) diagnostic_note(text, size, "PLP request=auto (not detected PLP)");
+		else if (plp > 255) diagnostic_note(text, size, "PLP request out of range: %u", plp);
+		else diagnostic_note(text, size, "PLP request=%u (ID; not detected PLP)", plp);
+	}
+	if (reported_stat(&stats[0], stat_errors[0]) && stats[0].u.st.stat[0].scale == FE_SCALE_RELATIVE &&
+	    stats[0].u.st.stat[0].uvalue > 65535)
+		diagnostic_note(text, size, "relative AGC outside 0..65535");
+	if ((mn72 || mn73) && reported_stat(&stats[1], stat_errors[1]) &&
+	    stats[1].u.st.stat[0].scale == FE_SCALE_DECIBEL && stats[1].u.st.stat[0].svalue < 0)
+		diagnostic_note(text, size, "negative C/N: check loaded driver revision");
+	if (!*text) diagnostic_note(text, size, "no profile-specific finding; lock does not verify TS delivery");
+}
+
+static void sample_frontend(struct frontend *f, bool table, FILE *table_output)
 {
 	char node[64];
 	snprintf(node, sizeof(node), "adapter%u/frontend%u", f->adapter, f->number);
 	if (!table) printf("  adapter%u/frontend%u\n", f->adapter, f->number);
-	if (!f->open_error || f->open_error == EBUSY) {
+	read_timer(true);
+	if (!f->open_error || temporary_error(f->open_error)) {
 		char *path = path_format(DEV_ROOT "/dvb/adapter%u/frontend%u", f->adapter, f->number);
-		f->fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		f->fd = frontend_open(path);
 		f->open_error = f->fd < 0 ? errno : 0;
 		free(path);
-		if (f->fd < 0 && f->open_error != EBUSY) record_error(f->open_error, false);
+		if (f->fd < 0) record_error(f->open_error, false);
 	}
 	if (f->fd < 0) {
+		read_timer(false);
 		f->previous_valid = false;
 		if (table) {
 			char issue[192] = "-";
 			if (f->open_error != EBUSY)
 				snprintf(issue, sizeof(issue), "%s (%d)", strerror(f->open_error), f->open_error);
-			printf("%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", node,
-			       f->open_error == EBUSY ? "BUSY" : "UNAVAILABLE", "n/a", "n/a", "n/a", "n/a", "n/a", issue);
+			fprintf(table_output, "%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", node,
+			       f->open_error == EBUSY ? "BUSY" : f->open_error == ETIMEDOUT ? "TIMEOUT" :
+			       f->open_error == EAGAIN ? "RETRY" : "UNAVAILABLE", "n/a", "n/a", "n/a", "n/a", "n/a", issue);
 		} else if (f->open_error == EBUSY) puts("    frontend busy (shared tuner in use; skipped)");
 		else printf("    frontend unavailable: %s (%d)\n", strerror(f->open_error), f->open_error);
 		return;
 	}
+	if (specialized && !f->profile_checked) {
+		struct dvb_frontend_info info = {0};
+		if (frontend_ioctl(f->fd, FE_GET_INFO, &info) == 0) {
+			info.name[sizeof(info.name) - 1] = 0;
+			f->module = frontend_module(info.name);
+			f->profile_checked = true;
+		}
+	}
 	fe_status_t status = 0;
-	bool status_valid = ioctl(f->fd, FE_READ_STATUS, &status) == 0;
+	bool status_valid = frontend_ioctl(f->fd, FE_READ_STATUS, &status) == 0;
 	int status_error = status_valid ? 0 : errno;
 	struct dtv_property parameters[ARRAY_SIZE(parameter_cmds)] = {0};
 	int errors[ARRAY_SIZE(parameter_cmds)];
@@ -655,21 +935,41 @@ static void sample_frontend(struct frontend *f, bool table)
 	for (size_t i = 0; i < ARRAY_SIZE(stats); i++) stats[i].cmd = stat_cmds[i];
 	get_properties(f->fd, stats, ARRAY_SIZE(stats), stat_errors);
 	for (size_t i = 0; i < ARRAY_SIZE(stats); i++) stat_errors[i] = validate_stat(&stats[i], stat_errors[i]);
-	bool counters_valid = !stat_errors[4] && !stat_errors[5];
+	legacy_stat(f->fd, &stats[0], &stat_errors[0], FE_READ_SIGNAL_STRENGTH, false);
+	legacy_stat(f->fd, &stats[1], &stat_errors[1], FE_READ_SNR, false);
+	legacy_stat(f->fd, &stats[6], &stat_errors[6], FE_READ_UNCORRECTED_BLOCKS, true);
+	uint32_t legacy_ber = 0;
+	int legacy_ber_error = 0;
+	bool legacy_ber_valid = false;
+	if (missing_stat(&stats[4], stat_errors[4]) && missing_stat(&stats[5], stat_errors[5])) {
+		legacy_ber_valid = frontend_ioctl(f->fd, FE_READ_BER, &legacy_ber) == 0;
+		if (!legacy_ber_valid && !unsupported_error(errno)) legacy_ber_error = errno;
+	}
+	/* Empty or disabled counters must not establish a BER baseline. */
+	bool counters_valid = !stat_errors[4] && !stat_errors[5] &&
+		stats[4].u.st.len && stats[5].u.st.len &&
+		stats[4].u.st.stat[0].scale == FE_SCALE_COUNTER &&
+		stats[5].u.st.stat[0].scale == FE_SCALE_COUNTER;
+	read_timer(false);
+	char diagnosis[512] = "";
+	if (specialized) specialized_diagnosis(f, parameters, errors, stats, stat_errors, diagnosis, sizeof(diagnosis));
 	bool locked = status_valid && (status & FE_HAS_LOCK) && !(status & (FE_REINIT | FE_TIMEDOUT));
 	if (table) {
 		char signal[48], cnr[48], blocks[48], frequency[32] = "n/a", ber[32] = "n/a", issue[256] = "";
-		const char *state = !status_valid ? "ERROR" : status & FE_REINIT ? "REINIT" :
+		const char *state = !status_valid ? (status_error == ETIMEDOUT ? "TIMEOUT" :
+			temporary_error(status_error) ? "RETRY" : "ERROR") : status & FE_REINIT ? "REINIT" :
 			status & FE_TIMEDOUT ? "TIMEOUT" : status & FE_HAS_LOCK ? "LOCKED" : "UNLOCKED";
 		table_error(issue, sizeof(issue), "status", status_error, false);
 		for (size_t i = 0; i < ARRAY_SIZE(parameters); i++) table_error(issue, sizeof(issue), parameter_names[i], errors[i], true);
 		for (size_t i = 0; i < ARRAY_SIZE(stats); i++) table_error(issue, sizeof(issue), stat_names[i], stat_errors[i], true);
+		table_error(issue, sizeof(issue), "legacy_BER_raw", legacy_ber_error, true);
 		table_stat(signal, sizeof(signal), &stats[0], stat_errors[0], 0);
 		table_stat(cnr, sizeof(cnr), &stats[1], stat_errors[1], 1);
 		table_stat(blocks, sizeof(blocks), &stats[6], stat_errors[6], 6);
 		if (!errors[0] && !errors[1])
 			snprintf(frequency, sizeof(frequency), "%.3f", parameters[1].u.data / (satellite(parameters[0].u.data) ? 1000.0 : 1000000.0));
 		if (status_valid && (status & FE_REINIT)) snprintf(ber, sizeof(ber), "reinit");
+		else if (legacy_ber_valid && locked) snprintf(ber, sizeof(ber), "raw:%" PRIu32, legacy_ber);
 		else if (parameters_valid && locked && counters_valid) {
 			if (!f->previous_valid) snprintf(ber, sizeof(ber), "baseline");
 			else if (changed) snprintf(ber, sizeof(ber), "retune");
@@ -683,7 +983,8 @@ static void sample_frontend(struct frontend *f, bool table)
 				}
 			}
 		}
-		printf("%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", node, state, frequency, signal, cnr, ber, blocks, *issue ? issue : "-");
+		fprintf(table_output, "%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", node, state, frequency, signal, cnr, ber, blocks,
+		        *issue ? issue : *diagnosis ? diagnosis : "-");
 	} else {
 		if (!status_valid) unavailable("status", status_error, false);
 		else {
@@ -705,6 +1006,9 @@ static void sample_frontend(struct frontend *f, bool table)
 			puts("");
 		}
 		for (size_t i = 0; i < ARRAY_SIZE(stats); i++) print_stat(&stats[i], i, stat_errors[i]);
+		if (specialized) printf("    diagnosis=%s\n", diagnosis);
+		if (legacy_ber_valid) printf("    legacy_BER_raw=%" PRIu32 " (driver-defined scale; not an interval ratio)\n", legacy_ber);
+		else if (legacy_ber_error) unavailable("legacy_BER_raw", legacy_ber_error, true);
 		if (status_valid && (status & FE_REINIT)) puts("    postBER_interval unavailable: frontend reinitialization");
 		if (f->previous_valid && parameters_valid && locked && counters_valid) {
 			if (changed) puts("    postBER_interval unavailable: tune changed");
@@ -715,6 +1019,25 @@ static void sample_frontend(struct frontend *f, bool table)
 	f->post_total = stats[5].u.st;
 	f->previous_valid = parameters_valid && locked && counters_valid;
 	close(f->fd); f->fd = -1;
+}
+
+static void present_table(const char *frame, size_t size)
+{
+	/* Keep the previous frame visible during device reads. Only overwrite
+	 * after the complete next frame is ready, without blanking the screen.
+	 * stdout is fully buffered here, so line rendering has no read delays.
+	 */
+	fputs("\033[H", stdout);
+	const char *start = frame, *end = frame + size;
+	for (const char *cursor = frame; cursor < end; cursor++) {
+		if (*cursor != '\n') continue;
+		fwrite(start, 1, (size_t)(cursor - start), stdout);
+		fputs("\033[K\n", stdout);
+		start = cursor + 1;
+	}
+	fwrite(start, 1, (size_t)(end - start), stdout);
+	fputs("\033[J", stdout);
+	fflush(stdout);
 }
 
 static void kernel_log(void)
@@ -739,13 +1062,18 @@ static void usage(FILE *stream)
 {
 	fputs("Usage: dvb-check [--table] [--watch SECONDS] [--count N] [--kernel-log]\n"
 	      "  Default: inventory and one read-only sample of every DVB frontend.\n"
+	      "  -a, --adapter N  restrict reads to adapter N\n"
+	      "  -f, --frontend N restrict reads to frontend N (within selected adapters)\n"
+	      "  --read-timeout SECONDS  interrupt frontend waits after 0.01..60 seconds (default 0.25)\n"
 	      "  --table          one status row per frontend; refresh capable terminals\n"
+	      "  --specialized    explain chip-specific statistics, driver settings and PLP requests\n"
 	      "  --watch SECONDS  repeat (0.1..3600 seconds); Ctrl+C ends capture\n"
 	      "  --count N        stop after N samples; default unlimited with --watch\n"
 	      "  --kernel-log     append full kernel ring at exit (usually needs root)\n"
 	      "  USB tracing setup prompts before loading usbmon/mounting debugfs; no/EOF skips setup.\n"
 	      "  --help           show this help\n"
-	      "Exit: 0 collection completed, 1 collection errors, 2 no frontends/invalid arguments.\n", stream);
+	      "Exit: 0 collection completed (busy/timeouts may be skipped), 1 collection errors,\n"
+	      "      2 no matching frontends/invalid arguments.\n", stream);
 }
 
 int main(int argc, char **argv)
@@ -753,16 +1081,35 @@ int main(int argc, char **argv)
 	double interval = 1;
 	unsigned long count = 1;
 	bool watch = false, count_set = false, logs = false, table = false;
+	unsigned selected_adapter = 0, selected_frontend = 0;
+	bool adapter_set = false, frontend_set = false;
 	const struct option options[] = {
 		{ "watch", required_argument, NULL, 'w' }, { "count", required_argument, NULL, 'c' },
 		{ "kernel-log", no_argument, NULL, 'k' }, { "help", no_argument, NULL, 'h' },
 		{ "table", no_argument, NULL, 't' },
+		{ "adapter", required_argument, NULL, 'a' },
+		{ "frontend", required_argument, NULL, 'f' },
+		{ "read-timeout", required_argument, NULL, 'r' },
+		{ "specialized", no_argument, NULL, 's' },
 		{ "version", no_argument, NULL, 'v' }, { NULL, 0, NULL, 0 },
 	};
 	int option;
-	while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
+	while ((option = getopt_long(argc, argv, "a:f:", options, NULL)) != -1) {
 		char *end;
 		switch (option) {
+		case 'a':
+		case 'f': {
+			errno = 0;
+			unsigned long value = strtoul(optarg, &end, 10);
+			if (errno || !isdigit((unsigned char)*optarg) || *end || value > UINT_MAX) goto bad_arguments;
+			if (option == 'a') { selected_adapter = value; adapter_set = true; }
+			else { selected_frontend = value; frontend_set = true; }
+			break;
+		}
+		case 'r':
+			errno = 0; read_timeout = strtod(optarg, &end);
+			if (errno || !*optarg || *end || !isfinite(read_timeout) || read_timeout < 0.01 || read_timeout > 60) goto bad_arguments;
+			break;
 		case 'w':
 			errno = 0; interval = strtod(optarg, &end);
 			if (errno || !*optarg || *end || !isfinite(interval) || interval < 0.1 || interval > 3600) goto bad_arguments;
@@ -773,6 +1120,7 @@ int main(int argc, char **argv)
 			count_set = true; break;
 		case 'k': logs = true; break;
 		case 't': table = true; break;
+		case 's': specialized = true; break;
 		case 'h': usage(stdout); return 0;
 		case 'v': puts("dvb-check " VERSION); return 0;
 		default: goto bad_arguments;
@@ -788,8 +1136,10 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &action, NULL);
 	sigaction(SIGHUP, &action, NULL);
 	sigaction(SIGPIPE, &action, NULL);
+	action.sa_handler = read_timeout_signal;
+	if (sigaction(SIGALRM, &action, NULL) < 0) { perror("frontend timeout signal"); return 1; }
 	if (atexit(cleanup_usbmon)) { fputs("Cannot register USB cleanup\n", stderr); return 1; }
-	setvbuf(stdout, NULL, _IOLBF, 0);
+	setvbuf(stdout, NULL, refresh ? _IOFBF : _IOLBF, 0);
 	struct utsname host;
 	puts("dvb-check " VERSION " (read-only DVB diagnostics)");
 	if (!uname(&host)) printf("Host: %s %s %s\n", host.nodename, host.release, host.machine);
@@ -799,10 +1149,18 @@ int main(int argc, char **argv)
 	     "A relative AGC reading is not calibrated RF power. Devices are inventoried at startup; restart after hotplug.");
 	struct frontend *frontends = NULL;
 	size_t total = discover(&frontends);
-	printf("Frontends discovered: %zu\n", total);
+	size_t selected = 0;
+	for (size_t i = 0; i < total; i++) {
+		if (adapter_set && frontends[i].adapter != selected_adapter) continue;
+		if (frontend_set && frontends[i].number != selected_frontend) continue;
+		frontends[selected++] = frontends[i];
+	}
+	printf("Frontends discovered: %zu; selected: %zu; read timeout: %.3fs\n", total, selected, read_timeout);
+	total = selected;
 	for (size_t i = 0; i < total; i++) inventory(&frontends[i]);
 	module_information();
-	if (!total) puts("No DVB frontends found under /sys/class/dvb or /dev/dvb.");
+	if (!total) puts("No matching DVB frontends found under /sys/class/dvb or /dev/dvb.");
+	fflush(stdout);
 	for (unsigned long sample = 0; total && !stopping && (!count || sample < count); sample++) {
 		struct timespec now;
 		struct tm utc;
@@ -810,15 +1168,24 @@ int main(int argc, char **argv)
 		if (!clock_gettime(CLOCK_REALTIME, &now) && gmtime_r(&now.tv_sec, &utc) &&
 		    strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &utc))
 			snprintf(stamp, sizeof(stamp), "%s.%03ldZ", date, now.tv_nsec / 1000000);
-		if (refresh) fputs("\033[H\033[2J", stdout);
-		printf("\nSAMPLE %lu %s\n", sample + 1, stamp);
+		char *frame = NULL;
+		size_t frame_size = 0;
+		FILE *output = refresh ? open_memstream(&frame, &frame_size) : stdout;
+		if (!output) { perror("allocate table frame"); collection_errors++; break; }
+		fprintf(output, "\nSAMPLE %lu %s\n", sample + 1, stamp);
 		if (table)
-			printf("%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", "FRONTEND", "STATUS", "MHz", "SIGNAL", "C/N", "postBER", "UCB", "ERROR");
-		for (size_t i = 0; i < total && !stopping; i++) sample_frontend(&frontends[i], table);
+			fprintf(output, "%-18s %-11s %8s %-9s %-8s %-8s %-6s %s\n", "FRONTEND", "STATUS", "MHz", "SIGNAL", "C/N", "postBER", "UCB", specialized ? "NOTE (errors first)" : "ERROR");
+		for (size_t i = 0; i < total && !stopping; i++) sample_frontend(&frontends[i], table, output);
 		if (table)
-			printf("Global layer (0); rel=relative AGC; !=check dBm calibration; UCB=reported error blocks.\n"
+			fprintf(output, "Global layer (0); rel=relative AGC; !=check dBm calibration; UCB=reported error blocks.\n"
 			       "Collection errors so far: %d. Detailed chip/layer information: run without --table.\n"
 			       "Reads are sequential; lock is not proof of transport delivery. Ctrl+C stops.\n", collection_errors);
+		if (refresh) {
+			int error = fclose(output);
+			if (!error && !stopping) present_table(frame, frame_size);
+			free(frame);
+			if (error) { perror("render table frame"); collection_errors++; break; }
+		}
 		if (count && sample + 1 == count) break;
 		struct timespec delay = { .tv_sec = (time_t)interval, .tv_nsec = (long)((interval - (time_t)interval) * 1e9) };
 		while (!stopping && nanosleep(&delay, &delay) < 0 && errno == EINTR) {}

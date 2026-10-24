@@ -396,6 +396,13 @@ make diagnostic
 sudo ./dvb-check --kernel-log
 sudo ./dvb-check --watch 1 --count 60 --kernel-log | tee dvb-report.txt
 sudo ./dvb-check --table --watch 1
+# Monitor only the frontend Tvheadend is currently using:
+sudo ./dvb-check -a 0 -f 1 --table --watch 1
+# Allow more time for a slow USB tuner:
+sudo ./dvb-check --read-timeout 1 --table --watch 1
+# Explain statistics using the chip/driver investigations:
+sudo ./dvb-check --specialized --table --watch 1
+sudo ./dvb-check -a 0 -f 1 --specialized --kernel-log
 ```
 
 `--table` displays every discovered frontend together, one status row per
@@ -406,7 +413,10 @@ An error on one frontend does not stop the others. Each frontend has its own
 BER baseline; retunes, resets, unlock and reinitialization invalidate it.
 
 In a terminal with `TERM` set to something other than `dumb`, the table refreshes
-in place. File/pipe output and basic terminals retain plain timestamped frames:
+in place. The previous table stays visible while tuners are read; each completed
+table is drawn together without clearing the screen first. Shorter rows and
+frames erase leftover text. File/pipe output and basic terminals retain plain
+timestamped frames:
 
 ```sh
 sudo ./dvb-check --table --watch 1 --count 60 --kernel-log | tee dvb-status.txt
@@ -417,9 +427,62 @@ counters may need more space. The table shows global layer 0; use the default
 detailed mode for all layers, chip information and all read-error explanations.
 `n/a` means no usable value, `baseline` needs another sample, `retune`/`reset`
 invalidate an interval, and `no-bits` means its counter did not advance.
+`raw:N` is a legacy driver BER value with an unspecified scale, not an interval
+BER ratio. Detailed mode labels it `legacy_BER_raw`. Legacy signal/SNR and
+uncorrected-block queries supplement missing or unsupported DVBv5 statistics;
+explicitly unavailable DVBv5 values (including disabled statistics groups) stay
+unavailable, and real I/O failures remain visible. Legacy signal/SNR are shown
+as relative values, never converted into dBm/dB.
 Relative AGC stays relative. A `!` after positive dBm flags suspicious driver
 calibration/units. Sampling still queries frontends sequentially and does not
 claim an atomic hardware snapshot or tune multiple devices.
+
+`--specialized` adds profiles selected from the frontend's own kernel-reported
+name: Sony CXD2837ER/2838ER/2841ER/2843ER/2854ER, Panasonic MN88472/MN88473
+and Realtek RTL2832. These explanations describe this repository's drivers;
+compare the loaded module versions printed in the report before applying them
+to another driver build. Unknown names retain generic diagnostics. A module
+loaded for another USB device never selects a frontend's profile.
+
+The specialized report reads each matching module's current `stats_mask`,
+decodes its bit assignments, and explains disabled strength/CNR/block/bit
+statistics. Missing, invalid or unreadable masks remain unknown; it never assumes
+the default or enables extra measurement traffic. MN88472 bit counters are
+unimplemented regardless of bit 8; MN88473 only implements BER for DVB-T/C,
+leaving DVB-T2 BER unavailable. Both Panasonic drivers accumulate counters,
+but hardware sample lifetime/read-clear behavior is still unverified; these
+diagnostics do not validate reception BER against an external reference.
+
+For DVB-T2, PLP selection is labeled as a **request**, including explicit ID
+zero and automatic selection. It is not a list of broadcast PLPs or proof of
+the selected received PLP. The MN88473 profile explains that decoded
+modulation/FEC/guard readback is unimplemented and those tune properties can be
+cached requests. Sony's profile explains the one-second statistics cache and
+the separate detected-QAM mask bit. Panasonic negative C/N and relative AGC
+outside its 16-bit range are flagged for investigation without inventing RF
+quality thresholds.
+Sony can expose pre-FEC bit counters while `postBER` remains unavailable
+(notably DVB-T/T2 and satellite); the specialized note identifies that case.
+Detailed output already lists both sets of counters separately.
+
+In specialized table mode, `NOTE (errors first)` replaces `ERROR`: actual read
+errors take priority over explanatory notes. Long notes need a wide terminal;
+the default detailed mode includes the full profile and diagnosis. The
+existing completed-frame refresh also applies to specialized tables.
+
+Global module diagnostics additionally report R820T IMR calibration selection,
+TDA18250 power/PLL visibility limits, exposed debug settings, DVB-core shared
+frontend/shutdown timing, and DiB0700 packet-buffer configuration. These global
+settings do not establish which RF tuner is paired with a frontend. The mode
+only reads existing DVB/sysfs information; it does not access raw I2C, switch
+register banks, change monitor windows, tune, or modify module parameters.
+
+Firmware running/parity, MN88473 startup-table/register-`0x36` state and TS-clock
+configuration are not exposed by the frontend API. The profiles point to
+`--kernel-log` and the driver's stage/offset/parity/TS error messages instead
+of claiming these checks passed. Compare cold-boot and failed warm-boot reports;
+an upload transfer error does not by itself establish a demodulator power fault,
+and demodulator lock does not prove that the USB bridge delivers TS packets.
 
 Prepared static binaries are in `dist/dvb-check-linux-aarch64` (OrangePi ARM64)
 and `dist/dvb-check-linux-x86_64`. Copy the matching binary onto the Linux host,
@@ -444,17 +507,28 @@ including attachment/chip messages and USB errors. It does not clear the ring;
 root permissions are usually needed, and older messages may already have
 been overwritten. Ctrl+C ends monitoring and still collects the requested log.
 
-The tool opens frontends read-only and only queries information/properties and
-status, closing each frontend after inventory and after each sample so shared
-frontends cannot block each other throughout monitoring. A busy frontend is
-reported as `BUSY` without counting a collection error or failing the run, and
-retried on the next sample. Monitoring resumes automatically when it becomes
-available. The kernel may wait several seconds even for a nonblocking open,
-so a busy retry can extend the refresh interval. Another application's use of
-a shared frontend can still prevent access
-to its sibling. The [Linux DVB API](https://docs.kernel.org/userspace-api/media/dvb/frontend_f_open.html)
-allows multiple read-only monitors alongside an
-existing tuning application. It does not retune, scan I2C, reset devices, reload
+The tool opens frontends with `O_RDONLY | O_NONBLOCK` and only queries
+information/properties and status. It closes each frontend after inventory and
+after each sample so the monitor does not hold a shared frontend across samples.
+The kernel's shared-frontend open wait and frontend semaphore can still sleep
+despite `O_NONBLOCK`. A signal timer interrupts those waits after a default
+250 ms budget per frontend inventory/sample, then the next frontend is read.
+Use `--read-timeout SECONDS` (0.01..60) to adjust that budget for slow hardware.
+Uninterruptible driver I/O and device release cannot be bounded by this timer;
+sampling remains sequential and the watch interval is a pause after each sweep.
+Busy or temporarily unavailable frontends are reported as `BUSY`, `RETRY` or
+`TIMEOUT` and retried on the next sample without failing the run. A successful
+exit means collection finished, not that every frontend was readable.
+
+Another application's use of a shared frontend can still prevent access to its
+inactive sibling. Use `-a N`/`--adapter N` and `-f N`/`--frontend N` to select
+Tvheadend's active frontend and avoid sibling waits altogether; without filters
+all discovered frontends are checked. The
+[Linux DVB API](https://docs.kernel.org/userspace-api/media/dvb/frontend_f_open.html)
+allows read-only monitors alongside an existing tuning application. Like
+[`dvb-fe-tool`'s monitor mode](https://github.com/gjasny/v4l-utils/blob/master/utils/dvb/dvb-fe-tool.c),
+this uses a separate read-only descriptor, never Tvheadend's frontend event
+queue or writable descriptor. It does not retune, scan I2C, reset devices, reload
 tuner drivers, change power settings, enable debug flags, or read the transport stream.
 One second is the recommended monitoring pause to limit extra polling.
 Lock alone does not establish transport delivery or reception health.
