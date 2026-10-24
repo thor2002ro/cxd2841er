@@ -7,6 +7,8 @@
 
 #include "mn88473_priv.h"
 
+#define MN88473_VERSION "1.0.0"
+
 static int mn88473_get_tune_settings(struct dvb_frontend *fe,
 				     struct dvb_frontend_tune_settings *s)
 {
@@ -762,5 +764,6 @@ module_i2c_driver(mn88473_driver);
 
 MODULE_AUTHOR("Antti Palosaari <crope@iki.fi>");
 MODULE_DESCRIPTION("Panasonic MN88473 DVB-T/T2/C demodulator driver");
+MODULE_VERSION(MN88473_VERSION);
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE(MN88473_FIRMWARE);

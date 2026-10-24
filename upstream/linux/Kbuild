@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0
 # Only modules containing local changes; companion objects form complete modules.
-obj-m := cxd2841er.o r820t.o mn88472.o rtl2832.o tda18250.o dvb-core.o \
+obj-m := cxd2841er.o r820t.o mn88472.o mn88473.o rtl2832.o tda18250.o dvb-core.o \
 	dvb-usb.o dvb_usb_v2.o dvb-usb-dib0700.o dvb-usb-rtl28xxu.o
 ifeq ($(CONFIG_DVB_CORE),y)
 obj-m := $(filter-out dvb-core.o,$(obj-m))
 endif
 
 cxd2841er-y := drivers/media/dvb-frontends/cxd2841er.o
+mn88473-y := drivers/media/dvb-frontends/mn88473.o
 mn88472-y := drivers/media/dvb-frontends/mn88472.o
 rtl2832-y := drivers/media/dvb-frontends/rtl2832.o
 r820t-y := drivers/media/tuners/r820t.o
