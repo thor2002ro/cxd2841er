@@ -14,7 +14,7 @@ All eleven custom modules expose a version through their module metadata:
 | `cxd2841er` | 1.1.11 |
 | `r820t` | 1.0.3 |
 | `mn88472` | 1.0.1 |
-| `mn88473` | 1.0.0 |
+| `mn88473` | 1.0.1 |
 | `rtl2832` | 1.0.0 |
 | `tda18250` | 1.0.0 |
 | `dvb-core` | 1.0.0 |
@@ -92,10 +92,26 @@ cxd2841er v1.1.11: CXD2837ER DVB-C/T/T2 frontend, chip ID 0xb1
   removal. Its `stats_mask` uses the same bits and strength-plus-CNR default as
   the Sony module.
 
-### `mn88473` 1.0.0
+### `mn88473` 1.0.1
 
 - Included in the build, version checks, installation and removal alongside
   MN88472; requires `CONFIG_DVB_MN88473=m` in the target kernel configuration.
+
+- Follows Astrometa's Windows upload sequence: writes `0xf0 = 0x20` before
+  entering download mode, uses single-byte writes through the fixed `0xf6`
+  program-data port, and pauses at least 1 ms every 200 bytes. On upload `-EAGAIN`
+  or an image parity failure, re-enters download mode and restarts the entire
+  image, with at most five attempts and a 20 ms pause between attempts.
+  Permanent transfer errors return immediately.
+
+- Logs the upload attempt, failing byte offset and error; validates firmware size
+  and transfer limits, and clears active/statistics state before initialization.
+
+- Clears old lock and statistics on status-read errors and starts each status
+  query unlocked, including inactive and early acquisition states.
+
+- Retains firmware parity checking before enabling output. Cold boot and repeated
+  warm reboot with real MN88473 hardware still need verification.
 
 ### `rtl2832` 1.0.0
 

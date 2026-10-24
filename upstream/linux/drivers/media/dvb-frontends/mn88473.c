@@ -6,8 +6,9 @@
  */
 
 #include "mn88473_priv.h"
+#include <linux/delay.h>
 
-#define MN88473_VERSION "1.0.0"
+#define MN88473_VERSION "1.0.1"
 
 static int mn88473_get_tune_settings(struct dvb_frontend *fe,
 				     struct dvb_frontend_tune_settings *s)
@@ -245,6 +246,8 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	unsigned int utmp, utmp1, utmp2;
 	u8 buf[5];
 
+	*status = 0;
+
 	if (!dev->active) {
 		ret = -EAGAIN;
 		goto err;
@@ -454,6 +457,13 @@ static int mn88473_read_status(struct dvb_frontend *fe, enum fe_status *status)
 
 	return 0;
 err:
+	*status = 0;
+	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->post_bit_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->post_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	dev_dbg(&client->dev, "failed=%d\n", ret);
 	return ret;
 }
@@ -463,12 +473,20 @@ static int mn88473_init(struct dvb_frontend *fe)
 	struct i2c_client *client = fe->demodulator_priv;
 	struct mn88473_dev *dev = i2c_get_clientdata(client);
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
-	int ret, len, remain;
+	int ret, remain, attempt;
 	unsigned int uitmp;
 	const struct firmware *fw;
 	const char *name = MN88473_FIRMWARE;
 
 	dev_dbg(&client->dev, "\n");
+
+	dev->active = false;
+	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->post_bit_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->post_bit_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_error.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
+	c->block_count.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 
 	/* Check if firmware is already running */
 	ret = regmap_read(dev->regmap[0], 0xf5, &uitmp);
@@ -487,37 +505,63 @@ static int mn88473_init(struct dvb_frontend *fe)
 
 	dev_info(&client->dev, "downloading firmware from file '%s'\n", name);
 
-	ret = regmap_write(dev->regmap[0], 0xf5, 0x03);
-	if (ret)
+	if (!fw->size || fw->size > INT_MAX || dev->i2c_wr_max < 2) {
+		ret = -EINVAL;
 		goto err_release_firmware;
-
-	for (remain = fw->size; remain > 0; remain -= (dev->i2c_wr_max - 1)) {
-		len = min(dev->i2c_wr_max - 1, remain);
-		ret = regmap_bulk_write(dev->regmap[0], 0xf6,
-					&fw->data[fw->size - remain], len);
-		if (ret) {
-			dev_err(&client->dev, "firmware download failed %d\n",
-				ret);
-			goto err_release_firmware;
-		}
 	}
 
-	release_firmware(fw);
+	/* A failed transfer may already have advanced the program-data port.
+	 * Restart the complete download rather than retrying that chunk here.
+	 */
+	for (attempt = 0; attempt < 5; attempt++) {
+		/* Astrometa AMDVBT2BDA: prepare the program interface before
+		 * entering download mode, including after a warm reboot.
+		 */
+		ret = regmap_write(dev->regmap[0], 0xf0, 0x20);
+		if (ret)
+			goto err_release_firmware;
+		ret = regmap_write(dev->regmap[0], 0xf5, 0x03);
+		if (ret)
+			goto err_release_firmware;
 
-	/* Parity check of firmware */
-	ret = regmap_read(dev->regmap[0], 0xf8, &uitmp);
-	if (ret)
-		goto err;
-
-	if (uitmp & 0x10) {
-		dev_err(&client->dev, "firmware parity check failed\n");
-		ret = -EINVAL;
-		goto err;
+		/* Match the vendor's single-byte writes and 1 ms pause every
+		 * 200 bytes instead of multi-byte transfers through the bridge.
+		 */
+		for (remain = fw->size; remain > 0; remain--) {
+			ret = regmap_noinc_write(dev->regmap[0], 0xf6,
+					&fw->data[fw->size - remain], 1);
+			if (ret)
+				break;
+			if ((fw->size - remain + 1) % 200 == 0)
+				usleep_range(1000, 2000);
+		}
+		if (ret) {
+			dev_warn(&client->dev,
+				 "firmware upload attempt %d failed at offset %zu: %d\n",
+				 attempt + 1, fw->size - remain, ret);
+			if (ret != -EAGAIN)
+				goto err_release_firmware;
+		} else {
+			/* Check the complete image on every upload attempt. */
+			ret = regmap_read(dev->regmap[0], 0xf8, &uitmp);
+			if (ret)
+				goto err_release_firmware;
+			if (!(uitmp & 0x10))
+				break;
+			dev_warn(&client->dev,
+				 "firmware parity check failed on attempt %d\n",
+				 attempt + 1);
+			ret = -EINVAL;
+		}
+		if (attempt == 4)
+			goto err_release_firmware;
+		msleep(20);
 	}
 
 	ret = regmap_write(dev->regmap[0], 0xf5, 0x00);
 	if (ret)
-		goto err;
+		goto err_release_firmware;
+	release_firmware(fw);
 warm:
 	/* TS config */
 	ret = regmap_write(dev->regmap[2], 0x09, 0x08);
@@ -608,6 +652,11 @@ static const struct dvb_frontend_ops mn88473_ops = {
 	.read_status = mn88473_read_status,
 };
 
+static bool mn88473_noinc_reg(struct device *dev, unsigned int reg)
+{
+	return reg == 0xf6;
+}
+
 static int mn88473_probe(struct i2c_client *client)
 {
 	struct mn88473_config *config = client->dev.platform_data;
@@ -615,6 +664,7 @@ static int mn88473_probe(struct i2c_client *client)
 	int ret;
 	unsigned int uitmp;
 	static const struct regmap_config regmap_config = {
+		.writeable_noinc_reg = mn88473_noinc_reg,
 		.reg_bits = 8,
 		.val_bits = 8,
 	};
